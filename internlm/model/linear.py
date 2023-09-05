@@ -9,6 +9,8 @@ from flash_attn.ops.fused_dense import ColumnParallelLinear, RowParallelLinear
 from flash_attn.utils.distributed import all_reduce, reduce_scatter
 from torch import nn
 
+from transformer_engine.pytorch import Linear
+
 from internlm.core.context import IS_TENSOR_PARALLEL, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.utils import fused_dense_func_torch
@@ -168,33 +170,63 @@ class FeedForward(nn.Module):
 
         hidden_features = multiple_of * ((hidden_features + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinearTorch(
-            in_features,
-            hidden_features,
-            process_group,
-            bias,
-            sequence_parallel=gpc.config.parallel.sequence_parallel,
-            device=device,
-            dtype=dtype,
-        )
-        self.w2 = ColumnParallelLinearTorch(
-            in_features,
-            hidden_features,
-            process_group,
-            bias,
-            sequence_parallel=gpc.config.parallel.sequence_parallel,
-            device=device,
-            dtype=dtype,
-        )
-        self.w3 = RowParallelLinearTorch(
-            hidden_features,
-            out_features,
-            process_group,
+        self.w1 = Linear(
+            in_features=in_features,
+            out_features=hidden_features,
+            tp_group=process_group,
+            tp_size=gpc.get_world_size(ParallelMode.TENSOR),
             bias=bias,
             sequence_parallel=gpc.config.parallel.sequence_parallel,
-            device=device,
-            dtype=dtype,
+            params_dtype=dtype,
+            parallel_mode="Column",
         )
+        # self.w1 = ColumnParallelLinearTorch(
+        #     in_features,
+        #     hidden_features,
+        #     process_group,
+        #     bias,
+        #     sequence_parallel=gpc.config.parallel.sequence_parallel,
+        #     device=device,
+        #     dtype=dtype,
+        # )
+        self.w2 = Linear(
+            in_features=in_features,
+            out_features=hidden_features,
+            tp_group=process_group,
+            tp_size=gpc.get_world_size(ParallelMode.TENSOR),
+            bias=bias,
+            sequence_parallel=gpc.config.parallel.sequence_parallel,
+            params_dtype=dtype,
+            parallel_mode="Column",
+        )
+        # self.w2 = ColumnParallelLinearTorch(
+        #     in_features,
+        #     hidden_features,
+        #     process_group,
+        #     bias,
+        #     sequence_parallel=gpc.config.parallel.sequence_parallel,
+        #     device=device,
+        #     dtype=dtype,
+        # )
+        self.w3 = Linear(
+            in_features=hidden_features,
+            out_features=out_features,
+            tp_group=process_group,
+            tp_size=gpc.get_world_size(ParallelMode.TENSOR),
+            bias=bias,
+            sequence_parallel=gpc.config.parallel.sequence_parallel,
+            params_dtype=dtype,
+            parallel_mode="Row",
+        )
+        # self.w3 = RowParallelLinearTorch(
+        #     hidden_features,
+        #     out_features,
+        #     process_group,
+        #     bias=bias,
+        #     sequence_parallel=gpc.config.parallel.sequence_parallel,
+        #     device=device,
+        #     dtype=dtype,
+        # )
         # need to assign tp attribute so that colossalai know it is tensor parallel module
 
         if gpc.get_world_size(ParallelMode.TENSOR) > 1:

@@ -14,6 +14,8 @@ from flash_attn.modules.mha import (
 )
 from torch import nn
 
+from transformer_engine.pytorch import Linear
+
 from internlm.core.context import IS_TENSOR_PARALLEL, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.embedding import RotaryEmbedding
@@ -77,14 +79,25 @@ class MHA(nn.Module):
             self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base, device=device)
 
         # notice here should change bias=True
-        self.Wqkv = ColumnParallelLinearTorch(
-            embed_dim,
-            3 * embed_dim,
-            process_group,
+        # using transformer engine
+        self.Wqkv = Linear(
+            in_features=embed_dim,
+            out_features=3 * embed_dim,
+            tp_group=process_group,
+            tp_size=gpc.get_world_size(ParallelMode.TENSOR),
             bias=True,
             sequence_parallel=gpc.config.parallel.sequence_parallel,
-            **factory_kwargs,
-        )  # according to https://spaces.ac.cn/archives/9577
+            params_dtype=dtype,
+            parallel_mode="Column",
+        )
+        # self.Wqkv = ColumnParallelLinearTorch(
+        #     embed_dim,
+        #     3 * embed_dim,
+        #     process_group,
+        #     bias=True,
+        #     sequence_parallel=gpc.config.parallel.sequence_parallel,
+        #     **factory_kwargs,
+        # )  # according to https://spaces.ac.cn/archives/9577
 
         inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
         inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
@@ -94,13 +107,23 @@ class MHA(nn.Module):
         )
 
         # output projection always have the bias (for now)
-        self.out_proj = RowParallelLinearTorch(
-            embed_dim,
-            embed_dim,
-            process_group,
+        self.out_proj = Linear(
+            in_features=embed_dim,
+            out_features=embed_dim,
+            tp_group=process_group,
+            tp_size=gpc.get_world_size(ParallelMode.TENSOR),
+            bias=True,
             sequence_parallel=gpc.config.parallel.sequence_parallel,
-            **factory_kwargs,
+            params_dtype=dtype,
+            parallel_mode="Row",
         )
+        # self.out_proj = RowParallelLinearTorch(
+        #     embed_dim,
+        #     embed_dim,
+        #     process_group,
+        #     sequence_parallel=gpc.config.parallel.sequence_parallel,
+        #     **factory_kwargs,
+        # )
         # need to assign tp attribute so that internlm know it is tensor parallel module
         if gpc.get_world_size(ParallelMode.TENSOR) > 1:
             for name in ["out_proj", "Wqkv"]:
