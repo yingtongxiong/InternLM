@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from flash_attn.modules.embedding import ParallelGPT2Embeddings
 from flash_attn.modules.mlp import ParallelFusedMLP
+from flash_attn.ops.rms_norm import dropout_add_rms_norm
 from torch import nn
 
 from internlm.core.context import IS_TENSOR_PARALLEL, ParallelMode
@@ -135,6 +136,9 @@ class PackedFlashBaseLayer1D(nn.Module):
         self.use_scaled_init = use_scaled_init
         self.residual_in_fp32 = residual_in_fp32  # only make sense when using prenorm
         self.return_residual = False
+        self.drop_rate = drop_rate
+        self.epsilon = layer_norm_epsilon
+        self.hidden_size = hidden_size
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -187,32 +191,40 @@ class PackedFlashBaseLayer1D(nn.Module):
             "inference_params": inference_params,
         }
 
-        def _dropout_and_norm_attn(_hidden_states):
-            _dropped = self.dropout1(_hidden_states)
-            _residual = _dropped
-            _hidden_states = self.norm1(_residual.float())
-            return _residual, _hidden_states
+        # def _dropout_and_norm_attn(_hidden_states):
+        #     _dropped = self.dropout1(_hidden_states)
+        #     _residual = _dropped
+        #     _hidden_states = self.norm1(_residual.float())
+        #     return _residual, _hidden_states
 
-        if self.dropout_selective_checkpoint:
-            residual, hidden_states = activation_checkpoint(_dropout_and_norm_attn, False, hidden_states)
-        else:
-            residual, hidden_states = _dropout_and_norm_attn(hidden_states)
+        # if self.dropout_selective_checkpoint:
+        #     residual, hidden_states = activation_checkpoint(_dropout_and_norm_attn, False, hidden_states)
+        # else:
+        #     residual, hidden_states = _dropout_and_norm_attn(hidden_states)
+        
+        # weight = nn.parameter.Parameter(torch.empty((self.hidden_size))).to('cuda')
+        # torch.nn.init.ones_(weight)
+        
+        hidden_states, residual = dropout_add_rms_norm(hidden_states.float(), None, self.norm1.weight.to(torch.float32), None, self.drop_rate, self.epsilon, None, None, True, self.residual_in_fp32, False)
+        # import pdb; pdb.set_trace()
+        # if self.residual_in_fp32:
+        #     residual = residual.to(torch.float32)
 
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+        hidden_states = self.mixer(hidden_states.to(torch.bfloat16), **mixer_kwargs)
 
-        hidden_states = self.mixer(hidden_states, **mixer_kwargs)
+        # def _dropout_and_norm_ffn(_residual, _hidden_states):
+        #     _dropped = self.dropout2(_hidden_states)
+        #     _residual = (_dropped + _residual) if _residual is not None else _dropped
+        #     _hidden_states = self.norm2(_residual.float())
+        #     return _residual, _hidden_states
 
-        def _dropout_and_norm_ffn(_residual, _hidden_states):
-            _dropped = self.dropout2(_hidden_states)
-            _residual = (_dropped + _residual) if _residual is not None else _dropped
-            _hidden_states = self.norm2(_residual.float())
-            return _residual, _hidden_states
-
-        if self.dropout_selective_checkpoint:
-            residual, hidden_states = activation_checkpoint(_dropout_and_norm_ffn, False, residual, hidden_states)
-        else:
-            residual, hidden_states = _dropout_and_norm_ffn(residual, hidden_states)
+        # if self.dropout_selective_checkpoint:
+        #     residual, hidden_states = activation_checkpoint(_dropout_and_norm_ffn, False, residual, hidden_states)
+        # else:
+        #     residual, hidden_states = _dropout_and_norm_ffn(residual, hidden_states)
+        
+        hidden_states, residual = dropout_add_rms_norm(hidden_states.float(), None, self.norm2.weight.to(torch.float32), None, self.drop_rate, self.epsilon, None, None, True, self.residual_in_fp32, False)
+        hidden_states = hidden_states.to(torch.bfloat16)
 
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
