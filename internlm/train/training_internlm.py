@@ -38,7 +38,6 @@ from internlm.model.embedding import Embedding1D
 from internlm.model.linear import (
     CoarseGrainedFSTPAllGatherSyncHandler,
     FeedForward,
-    FSTPAllGatherSyncHandler,
     RewardModelLinear,
     ScaleColumnParallelLinear,
 )

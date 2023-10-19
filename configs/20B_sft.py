@@ -162,9 +162,10 @@ sequence parallel (bool): enable/disable sequence parallel, defaults to False.
 """
 parallel = dict(
     zero1=dict(size=-1, fsdp=False),
-    tensor=dict(size=8, mode="fstp", overlap=True),
+    tensor=dict(size=8, mode="origin_tp", overlap=False),
     pipeline=dict(size=1, interleaved_overlap=True),
     sequence_parallel=True,
+    sp_megatron=True,
 )
 
 cudnn_deterministic = False

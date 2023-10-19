@@ -165,6 +165,7 @@ parallel = dict(
     tensor=dict(size=8, mode="origin_tp", overlap=False),
     pipeline=dict(size=1, interleaved_overlap=True),
     sequence_parallel=True,
+    sp_megatron=False,
 )
 
 cudnn_deterministic = False
