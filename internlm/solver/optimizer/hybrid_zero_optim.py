@@ -691,7 +691,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         except torch.cuda.OutOfMemoryError as e:
             print(e, flush=True)
             print(torch.cuda.memory_summary(), flush=True)
-            torch.cuda.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")
+            # torch.cuda.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")
             
         return res
 

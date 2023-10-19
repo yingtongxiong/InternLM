@@ -354,15 +354,16 @@ class FSTPFusedDenseFunc(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output, *args):
+        module = ctx.module
+        gpc.config.fstp_handler._pre_backward_hook_for_module_memory_pool(module, None)
+        block_index = ctx.block_index
+        module_name = ctx.module_name
         grad_output = grad_output.contiguous()
         if ctx.return_residual:
             (grad_input,) = args
             grad_input = grad_input.contiguous()
         process_group = ctx.process_group
         all_gather_handler = ctx.all_gather_handler
-        module = ctx.module
-        block_index = ctx.block_index
-        module_name = ctx.module_name
         
         if ctx.compute_weight_gradient:
             x, weight, bias = ctx.saved_tensors

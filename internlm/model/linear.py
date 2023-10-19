@@ -522,7 +522,49 @@ class CoarseGrainedFSTPAllGatherSyncHandler:
             # self.FSTP_global_weights[module] = total_weight
             self.FSTP_global_handle[module] = weight_handle
             # self.block_handles[block].append(weight_handle)
+    
+    def _pre_backward_hook_for_module_memory_pool(self, module: nn.Module, grad_output):
+            block_index = self.module_to_index[module]
+            name_index = self.module_name_index[module]
+            
+            if name_index == 4 and block_index == gpc.config.NUM_LAYER - 1:
+                # total_weight, weight_handler = all_gather_raw(module.weight, self.process_group, async_op=True)
+                weight_handler = self.FSTP_global_handle[module]
+                weight_handler.wait()
+                # self.FSTP_global_weights[module] = total_weight
 
+                # start the all-gather for next module
+                next_module = self.block_module[block_index][name_index - 1]
+                next_name = self.module_name[name_index - 1]
+                weights_handler = all_gather_raw_memory_pool(
+                    next_module.weight, self.process_group, async_op=True, block_index=block_index, module_name=next_name
+                )
+                self.FSTP_global_handle[next_module] = weights_handler
+            elif name_index == 0:
+                handler = self.FSTP_global_handle[module]
+                handler.wait()
+                
+                if block_index - 1 >= 0:
+                    next_module = self.block_module[block_index - 1][4]
+                    name = self.module_name[4]
+                    weights_handler = all_gather_raw_memory_pool(
+                        next_module.weight, self.process_group, async_op=True, block_index=block_index - 1, module_name=name,
+                    )
+                    self.FSTP_global_handle[next_module] = weights_handler
+            else:
+                handler = self.FSTP_global_handle[module]
+                handler.wait()
+                if name_index != 0:
+                    next_module = self.block_module[block_index][name_index - 1]
+                    name = self.module_name[name_index - 1]
+                    weights_handler = all_gather_raw_memory_pool(
+                        next_module.weight, self.process_group, async_op=True, block_index=block_index, module_name=name
+                    )
+                    self.FSTP_global_handle[next_module] = weights_handler
+                # if module in self.FSTP_global_handle:
+                #     handler = self.FSTP_global_handle[module]
+                #     handler.wait()
+        
     def _register_sync_parameters_hook(self) -> None:
         """
         register pre_forward_hook and pre_backward_hook for FSTP block.
@@ -724,5 +766,5 @@ class CoarseGrainedFSTPAllGatherSyncHandler:
             module.register_forward_pre_hook(_pre_forward_hook_for_module)
             module.register_forward_hook(_post_forward_hook_for_module)
             # module.register_full_backward_pre_hook(_pre_backward_hook_for_module)
-            module.register_full_backward_pre_hook(_pre_backward_hook_for_module_memory_pool)
+            # module.register_full_backward_pre_hook(_pre_backward_hook_for_module_memory_pool)
             module.register_full_backward_hook(_post_backward_hook_for_module)
