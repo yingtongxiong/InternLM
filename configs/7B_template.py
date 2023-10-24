@@ -1,8 +1,8 @@
 # JOB_NAME = "7b_train"
 DO_ALERT = False
 
-SEQ_LEN = {seq_len}
-JOB_NAME = "7b_train_" + str(SEQ_LEN) + "_" + str({sp}) + "_" + str({checkpoint})
+SEQ_LEN = 4096
+JOB_NAME = "7b_train_" + str({micro_bsz}) + "_" + str({sp}) + "_" + str({checkpoint})
 HIDDEN_SIZE = 4096
 NUM_ATTENTION_HEAD = 32
 MLP_RATIO = 8 / 3
@@ -52,7 +52,7 @@ data = dict(
     # micro_num means the number of micro_batch contained in one gradient update
     micro_num=1,
     # packed_length = micro_bsz * SEQ_LEN
-    micro_bsz=1,
+    micro_bsz={micro_bsz},
     # defaults to the value of micro_num
     valid_micro_num=4,
     # defaults to 0, means disable evaluate
@@ -126,7 +126,7 @@ beta2_scheduler = dict(
 )
 
 model = dict(
-    checkpoint={checkpoint},  # The proportion of layers for activation aheckpointing, the optional value are True/False/[0-1]
+    checkpoint={checkpoint},
     num_attention_heads=NUM_ATTENTION_HEAD,
     embed_split_hidden=True,
     vocab_size=VOCAB_SIZE,
