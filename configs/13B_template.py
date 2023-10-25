@@ -1,7 +1,7 @@
 DO_ALERT = False
 
-SEQ_LEN = 4096
-JOB_NAME = "13b_train_" + str({micro_bsz}) + "_" + str({sp}) + "_" + str({checkpoint})
+SEQ_LEN = {seq_len}
+JOB_NAME = "13b_train_" + str(SEQ_LEN) + "_" + str({sp}) + "_" + str({intern_overlap}) + "_" + str({checkpoint})
 HIDDEN_SIZE = 5120
 NUM_ATTENTION_HEAD = 40
 MLP_RATIO = 8 / 3
