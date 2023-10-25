@@ -5,7 +5,7 @@ import subprocess
 name = "./configs/"
 root_names = ["7B_train_", "13B_train_", "30B_train_"]
 model_size = ["7B", "13B", "30B"]
-seq_length = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
+micro_bsz = [1, 2, 4, 8, 16, 32, 64]
 sp = ["none", "megatron", "flash-attn", "intern", "intern"]
 intern_overlap = [False, False, False, True, False]
 checkpoint = [False, True]
@@ -32,7 +32,7 @@ for idx, root_name in enumerate(root_names):
                     line = line.replace("{intern_overlap}", str(intern_overlap[i]))
                     line = line.replace("{checkpoint}", str(ckpt))
                     output_file_name = (
-                        str(seq)
+                        str(mb)
                         + "_"
                         + str(sp_mode)
                         + "_overlap_"

@@ -1,8 +1,8 @@
 # JOB_NAME = "7b_train"
 DO_ALERT = False
 
-SEQ_LEN = {seq_len}
-JOB_NAME = "7b_train_" + str(SEQ_LEN) + "_" + str({sp}) + "_" + str({intern_overlap}) + "_" + str({checkpoint})
+SEQ_LEN = 4096
+JOB_NAME = "7b_train_" + str({micro_bsz}) + "_" + str({sp}) + "_" + str({intern_overlap}) + "_" + str({checkpoint})
 HIDDEN_SIZE = 4096
 NUM_ATTENTION_HEAD = 32
 MLP_RATIO = 8 / 3
