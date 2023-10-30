@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import torch
 from torch import nn
 
 from internlm.core.context import global_context as gpc
+from internlm.core.context import ParallelMode
 from internlm.core.naive_amp import NaiveAMPModel
 from internlm.core.scheduler import SchedulerHook
 from internlm.model.embedding import Embedding1D
@@ -16,6 +17,8 @@ from internlm.model.utils import (
     all_gather_raw_memory_pool,
 )
 from internlm.utils.common import get_current_device
+from internlm.solver.optimizer.store import BucketStore
+from internlm.solver.optimizer.utils import get_grad_accumulate_object
 
 
 class FSTPOverlapHandler:
@@ -37,6 +40,7 @@ class FSTPOverlapHandler:
         self.model_checkpoint = gpc.config.model.checkpoint
         self.is_forward = True
 
+        self._accum_grad_bucket = BucketStore(0, ParallelMode.DATA)  # args do not matter, just use it as a bucket.
         self.reduce_scatter_handlers = {}
         self.zero_const_pool = {}
 
@@ -78,7 +82,7 @@ class FSTPOverlapHandler:
         self.num_blocks = len(self.index_to_fstp_modules)
 
         self._initialize_memory_pool()
-        self._register_sync_parameters_hook()
+        self._register_sync_parameters_hook(model)
 
     def get_zero_by_shape(self, size: tuple, dtype, device) -> torch.Tensor:
         if size not in self.zero_const_pool:
@@ -206,7 +210,37 @@ class FSTPOverlapHandler:
             )
             self.fstp_global_handle[module] = weight_handle
 
-    def _register_sync_parameters_hook(self) -> None:
+    def _accum_grads_store_in_bucket(self, bucket: BucketStore, reduce_rank: Optional[int] = None) -> None:
+        for _param in bucket.get_param(reduce_rank):
+            if not hasattr(_param, "_fstp_reduce_scatter_str"):
+                continue
+
+            # wait and accumulate gardient.
+            _key = getattr(_param, "_fstp_reduce_scatter_str")
+            _comm_handle, _grad = self.reduce_scatter_handlers[_key]
+            _comm_handle.wait()
+            _param.grad.add_(_grad)
+
+            # release cuda memory.
+            self.release_reduce_scatter_memory(key=tuple(_grad.size()), index=_grad.index)
+            self.reduce_scatter_handlers[_key] = None
+
+        bucket.reset_by_rank(reduce_rank)
+
+    def _wait_reduce_scatter_and_accumulate_grads(self, param, reduce_rank: Optional[int] = None):
+        param_size = param.numel()
+
+        # check if the bucket is full
+        # if full, will reduce the grads already in the bucket
+        # after reduction, the bucket will be empty
+        if self._accum_grad_bucket.num_elements_in_bucket(reduce_rank) >= self._reduce_bucket_size:
+            self._accum_grads_store_in_bucket(self._accum_grad_bucket, reduce_rank)
+
+        # otherwise, add the parameter into bucket.
+        self._accum_grad_bucket.add_num_elements_in_bucket(param_size, reduce_rank)
+        self._accum_grad_bucket.add_param(param, reduce_rank)
+
+    def _register_sync_parameters_hook(self, model: nn.Module) -> None:
         """
         register forward hooks and backward hooks for fstp modules.
         """
@@ -290,6 +324,9 @@ class FSTPOverlapHandler:
             if module in self.fstp_global_handle:
                 del self.fstp_global_handle[module]
 
+        def _post_backward_hook_for_accum_grads(*args):  # pylint: disable=W0613
+            self._accum_grads_store_in_bucket(self._accum_grad_bucket)
+
         # register forward hooks
         # 1. register post_forward_hook @embedding module to prefetch for block 0
         # 2. register pre_forward_hook @out_proj module to prefetch for next block,
@@ -321,6 +358,30 @@ class FSTPOverlapHandler:
             for module in self.fstp_modules:
                 module.register_full_backward_pre_hook(_pre_backward_hook_for_module)
                 module.register_full_backward_hook(_post_backward_hook_for_module)
+
+        # register async reduce scatter hook to do real gradient accumulation.
+        for _chunk in model:
+            if isinstance(_chunk, NaiveAMPModel):
+                _chunk = _chunk.model
+
+            for param in _chunk.parameters():
+                if not param.requires_grad:
+                    continue
+
+                def _define_and_attach(_param):
+                    # get the AccumulateGrad object of the param itself
+                    # If these objects are not kept, reduction hooks may not be attached successfully.
+                    accum_grad_obj = get_grad_accumulate_object(_param)
+
+                    def async_accum_grad_hook(*args):  # pylint: disable=W0613
+                        self._wait_reduce_scatter_and_accumulate_grads(param=_param)
+
+                    accum_grad_obj.register_hook(async_accum_grad_hook)
+
+                _define_and_attach(param)
+
+            # after all, we need to accumulate gradients left in the accumulate gardient bucket.
+            _chunk.register_full_backward_hook(_post_backward_hook_for_accum_grads)
 
 
 class FSTPOverlapSchedulerHook(SchedulerHook):

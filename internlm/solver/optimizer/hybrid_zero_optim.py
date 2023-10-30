@@ -3,7 +3,7 @@
 
 import math
 from functools import partial
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -66,10 +66,6 @@ class HybridZeroOptimizer(BaseOptimizer):
         hysteresis = grad_scal_cfg.hysteresis
         max_scale = grad_scal_cfg.max_scale
 
-        self._fstp_handler = None
-        if gpc.config.parallel["tensor"]["sp"] == "intern" and gpc.config.parallel["tensor"]["intern_overlap"] is True:
-            self._fstp_handler = gpc.fstp_handler
-
         # Zero related args
         reduce_bucket_size = zero_cfg.reduce_bucket_size
         clip_grad_norm = zero_cfg.clip_grad_norm
@@ -88,7 +84,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         self._param_store = ParameterStore(ParallelMode.ZERO1)
         self._grad_store = GradientStore(ParallelMode.DATA)
         self._bucket_store: List[BucketStore] = []
-        self._accum_grad_buckets: List[BucketStore] = []
+
         self._bucket_in_progress = []
 
         # fp16 and fp32 params for mixed precision training
@@ -157,7 +153,6 @@ class HybridZeroOptimizer(BaseOptimizer):
             # TODO _broadcast_parallel_mode is not only used in broadcast, maybe can change its name
             self._broadcast_parallel_mode.append(zero_mode)
             self._bucket_store.append(BucketStore(group_id, param_group["dp_mode"]))
-            self._accum_grad_buckets.append(BucketStore(group_id, param_group["dp_mode"]))
 
             # assign parameters to ranks the params in the list are sorted
             params_per_rank, no_params_ranks = self._partition_param_list(group_id, param_group)
@@ -304,11 +299,6 @@ class HybridZeroOptimizer(BaseOptimizer):
                             reduce_rank=reduce_rank,
                         )
 
-                        reduce_scatter_checker = partial(
-                            self._wait_reduce_scatter_and_accumulate_grads,
-                            param=param,
-                            reduce_rank=reduce_rank,
-                        )
                         def reduction_sp_func():
                             handle = reduce_tensor(
                                 param.grad,
@@ -322,9 +312,6 @@ class HybridZeroOptimizer(BaseOptimizer):
                         # NOT IMPORTANT BUT GOOD TO KNOW:
                         # args here is not grad, but allow_unreacable and accumulate_grad
                         def reduce_grad_hook(*args):  # pylint: disable=W0613
-                            if self._fstp_handler is not None:
-                                reduce_scatter_checker()
-
                             if self.skip_grad_reduce is False:
                                 reduction_func()
 
@@ -357,39 +344,6 @@ class HybridZeroOptimizer(BaseOptimizer):
         tensor_rank = self._param_store.get_param_rank(param)
         group_id = getattr(param, "group_id")
         return tensor_rank == gpc.get_local_rank(self._broadcast_parallel_mode[group_id])
-
-    def _accum_grads_store_in_bucket(self, bucket: BucketStore, reduce_rank: Optional[int] = None) -> None:
-        for _param in bucket.get_param(reduce_rank):
-            if not hasattr(_param, "_fstp_reduce_scatter_str"):
-                continue
-
-            # wait and accumulate gardient.
-            _key = getattr(_param, "_fstp_reduce_scatter_str")
-            _comm_handle, _grad = self._fstp_handler.reduce_scatter_handlers[_key]
-            _comm_handle.wait()
-            _param.grad.add_(_grad)
-
-            # release cuda memory.
-            self._fstp_handler.release_reduce_scatter_memory(key=tuple(_grad.size()), index=_grad.index)
-            self._fstp_handler.reduce_scatter_handlers[_key] = None
-
-        bucket.reset_by_rank(reduce_rank)
-
-    def _wait_reduce_scatter_and_accumulate_grads(self, param, reduce_rank: Optional[int] = None):
-        param_size = param.numel()
-
-        group_id = getattr(param, "group_id")
-        current_bucket = self._accum_grad_buckets[group_id]
-
-        # check if the bucket is full
-        # if full, will reduce the grads already in the bucket
-        # after reduction, the bucket will be empty
-        if current_bucket.num_elements_in_bucket(reduce_rank) >= self._reduce_bucket_size:
-            self._accum_grads_store_in_bucket(current_bucket, reduce_rank)
-
-        # otherwise, add the parameter into bucket.
-        current_bucket.add_num_elements_in_bucket(param_size, reduce_rank)
-        current_bucket.add_param(param, reduce_rank)
 
     def _store_and_try_reduce_grads_by_bucket(self, param, reduce_rank=None):
         param_size = param.numel()
@@ -632,10 +586,6 @@ class HybridZeroOptimizer(BaseOptimizer):
                     # we should not reduce the param in moe
                     if param.grad is not None:
                         self._store_and_try_reduce_grads_by_bucket(param)
-
-        # we need to accumulate gradients left in the accumulate gardient bucket
-        for group_id in range(self.num_param_groups):
-            self._accum_grads_store_in_bucket(self._accum_grad_buckets[group_id], reduce_rank=None)
 
         # we need to reduce the gradients left in the communication bucket
         for group_id in range(self.num_param_groups):
