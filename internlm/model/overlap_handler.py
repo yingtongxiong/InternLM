@@ -6,8 +6,8 @@ from typing import Any, Optional, Union
 import torch
 from torch import nn
 
-from internlm.core.context import global_context as gpc
 from internlm.core.context import ParallelMode
+from internlm.core.context import global_context as gpc
 from internlm.core.naive_amp import NaiveAMPModel
 from internlm.core.scheduler import SchedulerHook
 from internlm.model.embedding import Embedding1D
@@ -16,9 +16,9 @@ from internlm.model.utils import (
     all_gather_raw_bias_memory_pool,
     all_gather_raw_memory_pool,
 )
-from internlm.utils.common import get_current_device
 from internlm.solver.optimizer.store import BucketStore
 from internlm.solver.optimizer.utils import get_grad_accumulate_object
+from internlm.utils.common import get_current_device
 
 
 class FSTPOverlapHandler:
