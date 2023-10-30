@@ -3,12 +3,16 @@ import os
 import subprocess
 
 name = "./configs/"
-root_names = ["7B_train_", "13B_train_", "30B_train_"]
-model_size = ["7B", "13B", "30B"]
-micro_bsz = [1, 2, 4, 8, 16, 32, 64]
+# root_names = ["7B_train_", "13B_train_", "30B_train_"]
+root_names = ["30B_train_"]
+# model_size = ["7B", "13B", "30B"]
+model_size = ["30B"]
+# micro_bsz = [1, 2, 4, 8, 16, 32, 64]
+micro_bsz = [32, 64]
 sp = ["none", "megatron", "flash-attn", "intern", "intern"]
 intern_overlap = [False, False, False, True, False]
-checkpoint = [False, True]
+# checkpoint = [False, True]
+checkpoint = [True]
 
 for idx, root_name in enumerate(root_names):
     # 指定要创建的文件夹路径
