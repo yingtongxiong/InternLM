@@ -325,6 +325,7 @@ class FSTPOverlapHandler:
                 del self.fstp_global_handle[module]
 
         def _post_backward_hook_for_accum_grads(*args):  # pylint: disable=W0613
+            torch.cuda.synchronize()
             self._accum_grads_store_in_bucket(self._accum_grad_bucket)
 
         # register forward hooks
