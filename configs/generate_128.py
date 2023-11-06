@@ -3,12 +3,17 @@ import copy
 import subprocess
 
 name = "./configs/"
-root_names = ["7B_train_128_", "13B_train_128_", "30B_train_128_", "65B_train_128_"]
-model_size = ["7B", "13B", "30B", "65B"]
-seq_length = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
+# root_names = ["7B_train_128_", "13B_train_128_", "30B_train_128_", "65B_train_128_"]
+root_names = ["65B_train_128_"]
+# model_size = ["7B", "13B", "30B", "65B"]
+model_size = ["65B"]
+# seq_length = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
+seq_length = [65536, 131072]
 sp = ["none", "megatron", "flash-attn", "intern", "intern"]
 intern_overlap = [False, False, False, True, False]
-checkpoint = [False, True]
+# checkpoint = [False, True]
+checkpoint = [True]
+
 
 for idx, root_name in enumerate(root_names):
 
@@ -38,13 +43,6 @@ for idx, root_name in enumerate(root_names):
                         file.write(line)
                         
                     log_name = root_name + "_" + output_file_name[:-3]
-                    
-                    skip = True
-                    
-                    if model_size[idx] in ["30B", "65B"]:
-                        skip = False
-                    if skip == True:
-                        continue
                     
                     print(log_name)
                     command = f"srun -p llm_t -N 16 -n 128 --ntasks-per-node=8 --gpus-per-task=1 python train.py --config {write_file} --profiling 2>&1 | tee ./fstp_logs_128/{log_name}.log"

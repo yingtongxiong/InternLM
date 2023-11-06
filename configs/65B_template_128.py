@@ -1,7 +1,7 @@
 DO_ALERT = False
 
 SEQ_LEN = {seq_len}
-JOB_NAME = "65b_train_128_" + str(SEQ_LEN) + "_" + str({sp}) + "_" + str({intern_overlap}) + "_" + str({checkpoint})
+JOB_NAME = "65b_train_128_" + str({seq_len}) + "_" + str({sp}) + "_" + str({intern_overlap}) + "_" + str({checkpoint})
 HIDDEN_SIZE = 8192
 NUM_ATTENTION_HEAD = 64
 MLP_RATIO = 8 / 3
@@ -57,7 +57,7 @@ data = dict(
     # defaults to 0, means disable evaluate
     valid_every=50,
     pack_sample_into_one=True,
-    total_steps=10,
+    total_steps=20,
     skip_batches="",
     rampup_batch_size="",
     # Datasets with less than 50 rows will be discarded
