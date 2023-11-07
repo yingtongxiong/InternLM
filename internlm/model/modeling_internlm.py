@@ -357,7 +357,7 @@ class PackedFlashInternLm1D(nn.Module):
                     use_scaled_init=use_scaled_init,
                     use_swiglu=use_swiglu,
                     use_flash_attn=use_flash_attn,
-                    sp_mode=self.sp_mode,
+                    sp_mode="intern" if lid % 2 == 0 else self.sp_mode,
                 )
                 for lid in range(num_layers)
             ]

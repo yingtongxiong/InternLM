@@ -114,8 +114,9 @@ def initialize_model():
     model = wrap_FSDP_model(model)
 
     gpc.fstp_handler = None
-    if gpc.config.parallel["tensor"]["sp"] == "intern" and gpc.config.parallel["tensor"]["intern_overlap"] is True:
-        gpc.fstp_handler = FSTPOverlapHandler(model, gpc.get_group(ParallelMode.TENSOR))
+    # if gpc.config.parallel["tensor"]["sp"] == "intern" and gpc.config.parallel["tensor"]["intern_overlap"] is True:
+    if gpc.config.parallel["tensor"]["intern_overlap"] is True:
+        gpc.fstp_handler = FSTPOverlapHandler(model, gpc.get_group(ParallelMode.TENSOR), True)
 
     return model
 

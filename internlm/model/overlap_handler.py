@@ -24,8 +24,10 @@ class FSTPOverlapHandler:
     FSTP overlap handler for managing the all-gather and reduce_scatter overlapping.
     """
 
-    def __init__(self, model: Union[nn.Module, nn.ModuleList], process_group) -> None:
+    def __init__(self, model: Union[nn.Module, nn.ModuleList], process_group, is_hybrid_sp: bool = False) -> None:
         self.process_group = process_group
+        self.is_hybrid_sp = is_hybrid_sp
+        self.fstp_wqkvs = []
         self.fstp_outs = []
         self.fstp_modules = []
         self.module_name = ["Wqkv", "out_proj", "w1", "w2", "w3"]
@@ -33,9 +35,7 @@ class FSTPOverlapHandler:
         self.bias_global_handle = dict()  # key: fstp module; value: module bias global all-gather op handle
         self.module_to_index = dict()  # key: fstp module; value: transformer block index
         self.index_to_fstp_modules = dict()  # key: transformer block index; value: fsdp modules
-        self.last_block = None
-        self.head = []
-        self.embedding = []
+        self.chunks = []
         self.model_checkpoint = gpc.config.model.checkpoint
         self.is_forward = True
 
@@ -46,37 +46,46 @@ class FSTPOverlapHandler:
         if not isinstance(model, nn.ModuleList):
             model = [model]
 
+        def _attach_fstp_linear(name, child, reduce_scatter_name):
+            if name == "Wqkv":
+                self.fstp_wqkvs.append(child)
+                self.module_to_index[child] = intern_idx
+            if name == "out_proj":
+                self.fstp_outs.append(child)
+                self.module_to_index[child] = intern_idx
+            if isinstance(child, FSTPLinear):
+                self.module_to_index[child] = intern_idx
+                self.fstp_modules.append(child)
+                self.index_to_fstp_modules[intern_idx].append(child)
+
+                setattr(child, "_fstp_name", name)
+
+                setattr(child.weight, "_fstp_reduce_scatter_str", f"{reduce_scatter_name}.weight")
+                if child.bias is not None:
+                    setattr(child.bias, "_fstp_reduce_scatter_str", f"{reduce_scatter_name}.bias")
+
         for _chunk in model:
             if isinstance(_chunk, NaiveAMPModel):
                 _chunk = _chunk.model
+            self.chunks.append(_chunk)
 
+            intern_idx = 0
             for _chunk_name, children in _chunk.named_children():
-                if isinstance(children, ScaleColumnParallelLinear):
-                    self.head.append(children)
-                elif isinstance(children, Embedding1D):
-                    self.embedding.append(children)
-                elif isinstance(children, nn.ModuleList):
-                    self.last_block = children[len(children) - 1]
-                    for idx, block in enumerate(children):
-                        self.index_to_fstp_modules[idx] = []
-                        for _sub_name, sub in block.named_children():
-                            sub_modules = list(sub.children())
-                            if len(sub_modules) > 0:
-                                for name, child in sub.named_children():
-                                    if name == "out_proj":
-                                        self.fstp_outs.append(child)
-                                        self.module_to_index[child] = idx
-                                    if isinstance(child, FSTPLinear):
-                                        self.module_to_index[child] = idx
-                                        self.fstp_modules.append(child)
-                                        self.index_to_fstp_modules[idx].append(child)
+                if not isinstance(children, nn.ModuleList):
+                    continue
 
-                                        setattr(child, "_fstp_name", name)
+                for idx, block in enumerate(children):
+                    # only process block with intern sp mode
+                    if idx % 2 == 1:
+                        continue
 
-                                        _full_name = f"{_chunk_name}.{idx}.{_sub_name}.{name}"
-                                        setattr(child.weight, "_fstp_reduce_scatter_str", f"{_full_name}.weight")
-                                        if child.bias is not None:
-                                            setattr(child.bias, "_fstp_reduce_scatter_str", f"{_full_name}.bias")
+                    self.index_to_fstp_modules[intern_idx] = []
+                    for _sub_name, sub in block.named_children():
+                        for name, child in sub.named_children():
+                            _full_name = f"{_chunk_name}.{intern_idx}.{_sub_name}.{name}"
+                            _attach_fstp_linear(name=name, child=child, reduce_scatter_name=_full_name)
+
+                    intern_idx += 1
 
         self.num_blocks = len(self.index_to_fstp_modules)
 
@@ -198,18 +207,36 @@ class FSTPOverlapHandler:
         register forward hooks and backward hooks for fstp modules.
         """
 
-        def _post_forward_hook_for_embedding(module: nn.Module, inputs: Any, output: Any):  # pylint: disable=W0613
+        def _pre_forward_hook_for_first_block(module: nn.Module, inputs: Any, output: Any):  # pylint: disable=W0613
             self._all_gather_block_weight_memory_pool(0)
 
-        def _pre_forward_hook_for_out_proj(module: nn.Module, inputs: Any):  # pylint: disable=W0613
-            block_index = self.module_to_index[module]
-            if self.model_checkpoint and self.is_forward is False:
-                if block_index - 1 >= 0:
-                    self._all_gather_block_weight_memory_pool(block_index - 1)
+        def _pre_backward_hook_for_last_block(module: nn.Module, grad_input, grad_output):  # pylint: disable=W0613
+            if self.is_hybrid_sp or self.model_checkpoint:
+                self._all_gather_block_weight_memory_pool(self.num_blocks - 1)
             else:
+                first_backward_module = self.fstp_modules[-1]
+                weight_handle = all_gather_raw_memory_pool(
+                    first_backward_module.weight,
+                    self.process_group,
+                    async_op=True,
+                    module=first_backward_module,
+                )
+                self.fstp_global_handle[first_backward_module] = weight_handle
+
+        def _prefetch_hook_for_block(module: nn.Module, *args):  # pylint: disable=W0613
+            """
+            1. 适用于所有情况的forward
+            2. 适用于开启了ckpt的backward
+            3. 适用于开启sp混合模式的backward
+            """
+            block_index = self.module_to_index[module]
+            if self.is_forward:
                 # start the all-gather for next block
                 if block_index + 1 < self.num_blocks:
                     self._all_gather_block_weight_memory_pool(block_index + 1)
+            else:
+                if block_index - 1 >= 0:
+                    self._all_gather_block_weight_memory_pool(block_index - 1)
 
         def _pre_forward_hook_for_module(module: nn.Module, inputs: Any):  # pylint: disable=W0613
             if module in self.fstp_global_handle:
@@ -228,35 +255,9 @@ class FSTPOverlapHandler:
                 self.fstp_global_handle[module] = weight_handle
                 weight_handle.wait()
 
-        def _pre_forward_hook_for_block(block: nn.Module, inputs: Any):  # pylint: disable=W0613
-            fstp_modules = self.index_to_fstp_modules[self.num_blocks - 1]
-            if module in fstp_modules:
-                weight_handle = all_gather_raw_memory_pool(
-                    module.weight,
-                    self.process_group,
-                    async_op=True,
-                    module=module,
-                )
-                self.fstp_global_handle[module] = weight_handle
-                weight_handle.wait()
-
         def _post_forward_hook_for_module(module: nn.Module, inputs: Any, output: Any):  # pylint: disable=W0613
             if module in self.fstp_global_handle:
                 del self.fstp_global_handle[module]
-
-        def _post_backward_hook_for_head(module: nn.Module, grad_input, grad_output):  # pylint: disable=W0613
-            first_backward_module = self.fstp_modules[-1]
-            weight_handle = all_gather_raw_memory_pool(
-                first_backward_module.weight,
-                self.process_group,
-                async_op=True,
-                module=first_backward_module,
-            )
-            self.fstp_global_handle[first_backward_module] = weight_handle
-
-        def _pre_backward_hook_for_head(module: nn.Module, grad_output):
-            if self.is_forward is False:
-                self._all_gather_block_weight_memory_pool(self.num_blocks - 1)
 
         def _pre_backward_hook_for_module(module: nn.Module, grad_output):  # pylint: disable=W0613
             # wait handle for current module
@@ -274,55 +275,65 @@ class FSTPOverlapHandler:
                 weight_handle.wait()
 
             # start the all-gather for next module
-            module_index = self.fstp_modules.index(module)
-            if module_index - 1 >= 0:
-                next_module = self.fstp_modules[module_index - 1]
-                weight_handle = all_gather_raw_memory_pool(
-                    next_module.weight,
-                    self.process_group,
-                    async_op=True,
-                    module=next_module,
-                )
-                self.fstp_global_handle[next_module] = weight_handle
+            if self.is_hybrid_sp is False and not self.model_checkpoint:
+                module_index = self.fstp_modules.index(module)
+                if module_index - 1 >= 0:
+                    next_module = self.fstp_modules[module_index - 1]
+                    weight_handle = all_gather_raw_memory_pool(
+                        next_module.weight,
+                        self.process_group,
+                        async_op=True,
+                        module=next_module,
+                    )
+                    self.fstp_global_handle[next_module] = weight_handle
 
         def _post_backward_hook_for_module(module, grad_input, grad_output):  # pylint: disable=W0613
             if module in self.fstp_global_handle:
                 del self.fstp_global_handle[module]
 
-        # register forward hooks
-        # 1. register post_forward_hook @embedding module to prefetch for block 0
-        # 2. register pre_forward_hook @out_proj module to prefetch for next block,
-        #    notice that next block's all_gather op should be after current block's all_to_all op
-        # 3. register pre_forward_hook @fstp_module to wait handle for current module
-        # 4. register post_forward_hook @fstp_module to release resource
-        for embedding in self.embedding:
-            embedding.register_forward_hook(_post_forward_hook_for_embedding)
+        # 给model注册hook为首尾block预取权重
+        # forward
+        for _chunk in self.chunks:
+            _chunk.register_forward_pre_hook(_pre_forward_hook_for_first_block)
+            _chunk.register_full_backward_pre_hook(_pre_backward_hook_for_last_block)
 
-        if self.model_checkpoint:
-            if gpc.is_last_rank(parallel_mode=ParallelMode.PIPELINE):
-                for head in self.head:
-                    head.register_full_backward_pre_hook(_pre_backward_hook_for_head)
-            else:
-                self.last_block.register_forward_pre_hook(_pre_forward_hook_for_block)
-
+        # 中间block注册hook
+        # forward
         for out_proj in self.fstp_outs:
-            out_proj.register_forward_pre_hook(_pre_forward_hook_for_out_proj)
-
+            out_proj.register_forward_pre_hook(_prefetch_hook_for_block)
         for module in self.fstp_modules:
             module.register_forward_pre_hook(_pre_forward_hook_for_module)
             module.register_forward_hook(_post_forward_hook_for_module)
+        # backward
+        if self.is_hybrid_sp and not self.model_checkpoint:
+            for wqkv in self.fstp_wqkvs:
+                wqkv.register_full_backward_pre_hook(_prefetch_hook_for_block)
+        for module in self.fstp_modules:
+            module.register_full_backward_pre_hook(_pre_backward_hook_for_module)
+            module.register_full_backward_hook(_post_backward_hook_for_module)
 
-        # register backward hooks
-        # 1. register post_backward_hook @head module to prefetch for the last block's last module
-        # 2. register pre_backward_hook @fstp_module to wait handle for current module and to prefetch for next module
-        # 3. register post_backward_hook @fstp_module to release resource
-        if not self.model_checkpoint:
-            for head in self.head:
-                head.register_full_backward_hook(_post_backward_hook_for_head)
+        # forward: block粒度
+        # embedding 为第一个 intern block prefetch weight
+        # 在当前 intern block(out_proj module）为下一个 intern block prefetch weight
+        # 流水线并行时，中间pp stage，第一个intern block手动wait weight
+        # 开启activation ckpt时
+        # 处理好 block index的步长
+        """
+        20 / 4 = 5
+        0 1 2 3 4
+        """
 
-            for module in self.fstp_modules:
-                module.register_full_backward_pre_hook(_pre_backward_hook_for_module)
-                module.register_full_backward_hook(_post_backward_hook_for_module)
+        # backward: block粒度
+        # head 为第一个 intern block prefetch weight
+        # 在当前 intern block(wqkv module) 为下一个intern block prefetch weight
+        # 流水线并行时，中间pp stage，第一个intern block手动wait weight
+        # 开启activation ckpt时
+
+        # 以上处理逻辑，目的为了仅针对intern block，简化overlap handler处理逻辑；
+        # 但是存在一种情况，开pp时，中间stage，可能需要非 intern block 为 第一个 intern block prefetch weight
+
+        # 考虑到pp和非pp为第一个block prefetch weight的统一性，我们可以以整个model为粒度，
+        # 在model forward之前为第一个block prefetch，在model backward之前为第一个block prefetch
 
 
 class FSTPOverlapSchedulerHook(SchedulerHook):
@@ -335,8 +346,7 @@ class FSTPOverlapSchedulerHook(SchedulerHook):
         self._zero_optim = zero_optim
 
     def before_forward(self, scheduler, inputs) -> None:
-        if self._overlap_handler.model_checkpoint:
-            self._overlap_handler.set_forward_mode(True)
+        self._overlap_handler.set_forward_mode(True)
 
     def after_forward(self, scheduler, outputs) -> None:
         pass
@@ -348,8 +358,7 @@ class FSTPOverlapSchedulerHook(SchedulerHook):
         pass
 
     def before_backward(self, scheduler, outputs, outputs_grad) -> None:
-        if self._overlap_handler.model_checkpoint:
-            self._overlap_handler.set_forward_mode(False)
+        self._overlap_handler.set_forward_mode(False)
 
     def after_backward(self, scheduler, inputs_grad) -> None:
         self._zero_optim.accumulate_left_grads_after_backward()
