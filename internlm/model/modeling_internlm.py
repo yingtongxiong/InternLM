@@ -80,6 +80,7 @@ class PackedFlashBaseLayer1D(nn.Module):
         sp_mode: str = "none",
     ):
         super().__init__()
+        self.sp_mode = sp_mode
         self.checkpoint = checkpoint
         # dropout selective checkpoint can only be enabled when checkpoint is disabled.
         self.dropout_selective_checkpoint = dropout_selective_checkpoint is True and checkpoint is False
@@ -199,6 +200,15 @@ class PackedFlashBaseLayer1D(nn.Module):
             cu_seqlens: 1d LongTensor, len(cu_seqlens) = hidden_states + 1
             indexes: the length of index is same as hidden states, which stand for the current position
         """
+
+        if indexes is not None:
+            assert len(indexes) == 1
+            # The indexes are used to indicate the actual position IDs of each token in the packed input.
+            indexes = indexes[0]
+            # if the sequence parallel mode is 'intern', the indexes should also be split in sequence dimension.
+            if gpc.config.parallel.sequence_parallel and self.sp_mode == "intern":
+                indexes = split_forward_gather_backward(indexes, ParallelMode.TENSOR, dim=0)
+
         mixer_kwargs = {
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
@@ -403,13 +413,13 @@ class PackedFlashInternLm1D(nn.Module):
             hidden_states = hidden_states.squeeze(0)  # If cu_seqlens is passed in，it indicated a packed state，
             # the batch dimension with a size of 1 should be directly squeezed off.
 
-        if indexes is not None:
-            assert len(indexes) == 1
-            # The indexes are used to indicate the actual position IDs of each token in the packed input.
-            indexes = indexes[0]
-            # if the sequence parallel mode is 'intern', the indexes should also be split in sequence dimension.
-            if gpc.config.parallel.sequence_parallel and self.sp_mode == "intern":
-                indexes = split_forward_gather_backward(indexes, ParallelMode.TENSOR, dim=0)
+        # if indexes is not None:
+        #     assert len(indexes) == 1
+        #     # The indexes are used to indicate the actual position IDs of each token in the packed input.
+        #     indexes = indexes[0]
+        #     # if the sequence parallel mode is 'intern', the indexes should also be split in sequence dimension.
+        #     if gpc.config.parallel.sequence_parallel and self.sp_mode == "intern":
+        #         indexes = split_forward_gather_backward(indexes, ParallelMode.TENSOR, dim=0)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() if cu_seqlens is not None else None
 

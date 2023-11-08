@@ -42,6 +42,8 @@ class FSTPOverlapHandler:
         self.reduce_scatter_handlers = {}
         self.zero_const_pool = {}
 
+        self._comm_stream = torch.cuda.Stream()
+
         # just want to share same for loop for ModuleList and Module
         if not isinstance(model, nn.ModuleList):
             model = [model]
@@ -184,44 +186,46 @@ class FSTPOverlapHandler:
 
     def _all_gather_block_weight_memory_pool(self, block_index: int):
         fstp_modules = self.index_to_fstp_modules[block_index]
-        for module in fstp_modules:
-            if module.bias is not None:
-                bias_handle = all_gather_raw_bias_memory_pool(
-                    module.bias,
+        with torch.cuda.stream(self._comm_stream):
+            for module in fstp_modules:
+                if module.bias is not None:
+                    bias_handle = all_gather_raw_bias_memory_pool(
+                        module.bias,
+                        self.process_group,
+                        async_op=True,
+                        module=module,
+                    )
+                    self.bias_global_handle[module] = bias_handle
+
+                weight_handle = all_gather_raw_memory_pool(
+                    module.weight,
                     self.process_group,
                     async_op=True,
                     module=module,
                 )
-                self.bias_global_handle[module] = bias_handle
-
-            weight_handle = all_gather_raw_memory_pool(
-                module.weight,
-                self.process_group,
-                async_op=True,
-                module=module,
-            )
-            self.fstp_global_handle[module] = weight_handle
+                self.fstp_global_handle[module] = weight_handle
 
     def _register_sync_parameters_hook(self) -> None:
         """
         register forward hooks and backward hooks for fstp modules.
         """
 
-        def _pre_forward_hook_for_first_block(module: nn.Module, inputs: Any, output: Any):  # pylint: disable=W0613
+        def _pre_forward_hook_for_first_block(module: nn.Module, inputs: Any):  # pylint: disable=W0613
             self._all_gather_block_weight_memory_pool(0)
 
-        def _pre_backward_hook_for_last_block(module: nn.Module, grad_input, grad_output):  # pylint: disable=W0613
+        def _pre_backward_hook_for_last_block(module: nn.Module, grad_output):  # pylint: disable=W0613
             if self.is_hybrid_sp or self.model_checkpoint:
                 self._all_gather_block_weight_memory_pool(self.num_blocks - 1)
             else:
                 first_backward_module = self.fstp_modules[-1]
-                weight_handle = all_gather_raw_memory_pool(
-                    first_backward_module.weight,
-                    self.process_group,
-                    async_op=True,
-                    module=first_backward_module,
-                )
-                self.fstp_global_handle[first_backward_module] = weight_handle
+                with torch.cuda.stream(self._comm_stream):
+                    weight_handle = all_gather_raw_memory_pool(
+                        first_backward_module.weight,
+                        self.process_group,
+                        async_op=True,
+                        module=first_backward_module,
+                    )
+                    self.fstp_global_handle[first_backward_module] = weight_handle
 
         def _prefetch_hook_for_block(module: nn.Module, *args):  # pylint: disable=W0613
             """
@@ -239,53 +243,55 @@ class FSTPOverlapHandler:
                     self._all_gather_block_weight_memory_pool(block_index - 1)
 
         def _pre_forward_hook_for_module(module: nn.Module, inputs: Any):  # pylint: disable=W0613
-            if module in self.fstp_global_handle:
-                handle = self.fstp_global_handle[module]
-                handle.wait()
-                if module.bias is not None:
-                    bias_handle = self.bias_global_handle[module]
-                    bias_handle.wait()
-            else:
-                weight_handle = all_gather_raw_memory_pool(
-                    module.weight,
-                    self.process_group,
-                    async_op=True,
-                    module=module,
-                )
-                self.fstp_global_handle[module] = weight_handle
-                weight_handle.wait()
+            with torch.cuda.stream(self._comm_stream):
+                if module in self.fstp_global_handle:
+                    handle = self.fstp_global_handle[module]
+                    handle.wait()
+                    if module.bias is not None:
+                        bias_handle = self.bias_global_handle[module]
+                        bias_handle.wait()
+                else:
+                    weight_handle = all_gather_raw_memory_pool(
+                        module.weight,
+                        self.process_group,
+                        async_op=True,
+                        module=module,
+                    )
+                    self.fstp_global_handle[module] = weight_handle
+                    weight_handle.wait()
 
         def _post_forward_hook_for_module(module: nn.Module, inputs: Any, output: Any):  # pylint: disable=W0613
             if module in self.fstp_global_handle:
                 del self.fstp_global_handle[module]
 
         def _pre_backward_hook_for_module(module: nn.Module, grad_output):  # pylint: disable=W0613
-            # wait handle for current module
-            if module in self.fstp_global_handle:
-                weight_handle = self.fstp_global_handle[module]
-                weight_handle.wait()
-            else:
-                weight_handle = all_gather_raw_memory_pool(
-                    module.weight,
-                    self.process_group,
-                    async_op=True,
-                    module=module,
-                )
-                self.fstp_global_handle[module] = weight_handle
-                weight_handle.wait()
-
-            # start the all-gather for next module
-            if self.is_hybrid_sp is False and not self.model_checkpoint:
-                module_index = self.fstp_modules.index(module)
-                if module_index - 1 >= 0:
-                    next_module = self.fstp_modules[module_index - 1]
+            with torch.cuda.stream(self._comm_stream):
+                # wait handle for current module
+                if module in self.fstp_global_handle:
+                    weight_handle = self.fstp_global_handle[module]
+                    weight_handle.wait()
+                else:
                     weight_handle = all_gather_raw_memory_pool(
-                        next_module.weight,
+                        module.weight,
                         self.process_group,
                         async_op=True,
-                        module=next_module,
+                        module=module,
                     )
-                    self.fstp_global_handle[next_module] = weight_handle
+                    self.fstp_global_handle[module] = weight_handle
+                    weight_handle.wait()
+
+                # start the all-gather for next module
+                if self.is_hybrid_sp is False and not self.model_checkpoint:
+                    module_index = self.fstp_modules.index(module)
+                    if module_index - 1 >= 0:
+                        next_module = self.fstp_modules[module_index - 1]
+                        weight_handle = all_gather_raw_memory_pool(
+                            next_module.weight,
+                            self.process_group,
+                            async_op=True,
+                            module=next_module,
+                        )
+                        self.fstp_global_handle[next_module] = weight_handle
 
         def _post_backward_hook_for_module(module, grad_input, grad_output):  # pylint: disable=W0613
             if module in self.fstp_global_handle:
