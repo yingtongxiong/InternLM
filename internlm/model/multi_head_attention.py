@@ -172,6 +172,7 @@ class MHA(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         sp_mode: str = "none",
+        reorder_bwd_comm: bool = False,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -220,7 +221,7 @@ class MHA(nn.Module):
             self.inner_cross_attn = DistributedAttention(self.inner_cross_attn, sequence_process_group=process_group)
 
         # output projection always have the bias (for now)
-        out_proj_cls = get_linear_cls(sp_mode, "row")
+        out_proj_cls = get_linear_cls(sp_mode, "row", reorder_bwd_comm=reorder_bwd_comm)
         self.out_proj = out_proj_cls(
             embed_dim,
             embed_dim,
@@ -229,6 +230,7 @@ class MHA(nn.Module):
             sequence_parallel=gpc.config.parallel.sequence_parallel,
             **factory_kwargs,
         )
+
         # need to assign tp attribute so that internlm know it is tensor parallel module
         if gpc.get_world_size(ParallelMode.TENSOR) > 1:
             for name in ["out_proj", "Wqkv"]:

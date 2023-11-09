@@ -11,6 +11,7 @@ from torch import nn
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.utils import (
+    ReduceScatterFuncHack,
     Silu,
     fstp_fused_dense_func,
     fused_dense_func_torch,
@@ -198,6 +199,17 @@ class MegatronRowParallelLinearTorch(RowParallelLinear):
         """
         out = megatron_fused_dense_func_torch(x, self.weight, self.bias)
         reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+        return reduce_fn(out, self.process_group)
+
+
+class MegatronRowParallelLinearTorchReorderBwdComm(RowParallelLinear):
+    def forward(self, x):
+        """
+        We're doing Tensor Parallel with sequence parallelism: we do the matmul and then
+        a reduce_scatter of the result.
+        """
+        out = megatron_fused_dense_func_torch(x, self.weight, self.bias)
+        reduce_fn = ReduceScatterFuncHack.apply if self.sequence_parallel else all_reduce
         return reduce_fn(out, self.process_group)
 
 
@@ -413,7 +425,7 @@ def get_mlp_cls(sp_mode: str):
     return mlp_cls
 
 
-def get_linear_cls(sp_mode: str, parallel_mode: str):
+def get_linear_cls(sp_mode: str, parallel_mode: str, reorder_bwd_comm: bool = False):
     if parallel_mode == "column":
         if sp_mode in ["none", "flash-attn"]:
             cls = ColumnParallelLinearTorch
@@ -425,7 +437,10 @@ def get_linear_cls(sp_mode: str, parallel_mode: str):
         if sp_mode in ["none", "flash-attn"]:
             cls = RowParallelLinearTorch
         elif sp_mode == "megatron":
-            cls = MegatronRowParallelLinearTorch
+            if reorder_bwd_comm:
+                cls = MegatronRowParallelLinearTorchReorderBwdComm
+            else:
+                cls = MegatronRowParallelLinearTorch
         else:
             cls = FSTPLinear
     return cls

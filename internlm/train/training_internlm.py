@@ -116,7 +116,8 @@ def initialize_model():
     gpc.fstp_handler = None
     # if gpc.config.parallel["tensor"]["sp"] == "intern" and gpc.config.parallel["tensor"]["intern_overlap"] is True:
     if gpc.config.parallel["tensor"]["intern_overlap"] is True:
-        gpc.fstp_handler = FSTPOverlapHandler(model, gpc.get_group(ParallelMode.TENSOR), True)
+        reorder_bwd_comm = gpc.config.parallel["tensor"]["reorder_bwd_comm"]
+        gpc.fstp_handler = FSTPOverlapHandler(model, gpc.get_group(ParallelMode.TENSOR), True, reorder_bwd_comm)
 
     return model
 

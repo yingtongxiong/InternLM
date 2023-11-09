@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
-from typing import Optional
+import collections
+from typing import Deque, Optional
 
 import fused_dense_lib as fused_dense_cuda
 import torch
@@ -14,6 +15,8 @@ from torch.distributed import ProcessGroup
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.utils.logger import get_logger
+
+comm_queue: Deque = collections.deque()
 
 logger = get_logger(__file__)
 
@@ -183,6 +186,24 @@ def reduce_scatter_raw_memory_pool(input_: Tensor, process_group: ProcessGroup, 
         output, input_.contiguous(), group=process_group, async_op=async_op
     )
     return output, handle
+
+
+class ReduceScatterFuncHack(torch.autograd.Function):
+    """Reduce scatter the input from the sequence parallel region and concatenate."""
+
+    @staticmethod
+    def forward(ctx, input_: Tensor, process_group: ProcessGroup) -> Tensor:
+        ctx.process_group = process_group
+        output, _ = reduce_scatter_raw(input_, process_group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        grad_input, _ = all_gather_raw(grad_output, ctx.process_group)
+        while comm_queue:
+            comm = comm_queue.popleft()
+            comm()
+        return grad_input, None
 
 
 # adpated from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/ops/fused_dense.py

@@ -78,6 +78,7 @@ class PackedFlashBaseLayer1D(nn.Module):
         use_swiglu: bool = True,
         use_flash_attn: bool = True,
         sp_mode: str = "none",
+        reorder_bwd_comm: bool = False,
     ):
         super().__init__()
         self.sp_mode = sp_mode
@@ -104,6 +105,7 @@ class PackedFlashBaseLayer1D(nn.Module):
             device=device,
             dtype=dtype,
             sp_mode=sp_mode,
+            reorder_bwd_comm=reorder_bwd_comm,
         )
 
         self.dropout1 = nn.Dropout(drop_rate)
@@ -314,6 +316,9 @@ class PackedFlashInternLm1D(nn.Module):
 
         checkpoint_layer_num = int(num_layers * checkpoint)
         self.sp_mode = gpc.config.parallel["tensor"]["sp"]
+        self.reorder_bwd_comm = gpc.config.parallel["tensor"]["reorder_bwd_comm"]
+        if self.reorder_bwd_comm:
+            logger.warning("enable reorder_bwd_comm!")
         if self.sp_mode == "none":
             gpc.config.parallel.sequence_parallel = False
         else:
@@ -368,6 +373,7 @@ class PackedFlashInternLm1D(nn.Module):
                     use_swiglu=use_swiglu,
                     use_flash_attn=use_flash_attn,
                     sp_mode="intern" if lid % 2 == 0 else self.sp_mode,
+                    reorder_bwd_comm=self.reorder_bwd_comm,
                 )
                 for lid in range(num_layers)
             ]

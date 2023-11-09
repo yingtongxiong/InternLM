@@ -6,15 +6,14 @@ from typing import Any, Union
 import torch
 from torch import nn
 
-from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.naive_amp import NaiveAMPModel
 from internlm.core.scheduler import SchedulerHook
-from internlm.model.embedding import Embedding1D
-from internlm.model.linear import FSTPLinear, ScaleColumnParallelLinear
+from internlm.model.linear import FSTPLinear
 from internlm.model.utils import (
     all_gather_raw_bias_memory_pool,
     all_gather_raw_memory_pool,
+    comm_queue,
 )
 from internlm.utils.common import get_current_device
 
@@ -24,9 +23,16 @@ class FSTPOverlapHandler:
     FSTP overlap handler for managing the all-gather and reduce_scatter overlapping.
     """
 
-    def __init__(self, model: Union[nn.Module, nn.ModuleList], process_group, is_hybrid_sp: bool = False) -> None:
+    def __init__(
+        self,
+        model: Union[nn.Module, nn.ModuleList],
+        process_group,
+        is_hybrid_sp: bool = False,
+        reorder_bwd_comm: bool = False,
+    ) -> None:
         self.process_group = process_group
         self.is_hybrid_sp = is_hybrid_sp
+        self.reorder_bwd_comm = reorder_bwd_comm
         self.fstp_wqkvs = []
         self.fstp_outs = []
         self.fstp_modules = []
@@ -43,6 +49,9 @@ class FSTPOverlapHandler:
         self.zero_const_pool = {}
 
         self._comm_stream = torch.cuda.Stream()
+
+        if self.reorder_bwd_comm:
+            assert self.is_hybrid_sp, "reorder_bwd_comm only support hybrid_sp!"
 
         # just want to share same for loop for ModuleList and Module
         if not isinstance(model, nn.ModuleList):
@@ -240,7 +249,14 @@ class FSTPOverlapHandler:
                     self._all_gather_block_weight_memory_pool(block_index + 1)
             else:
                 if block_index - 1 >= 0:
-                    self._all_gather_block_weight_memory_pool(block_index - 1)
+                    if self.reorder_bwd_comm:
+
+                        def hack_all_gather():
+                            self._all_gather_block_weight_memory_pool(block_index - 1)
+
+                        comm_queue.append(hack_all_gather)  # 交错的sp混合模式可以保证comm_queue中的通信被触发
+                    else:
+                        self._all_gather_block_weight_memory_pool(block_index - 1)
 
         def _pre_forward_hook_for_module(module: nn.Module, inputs: Any):  # pylint: disable=W0613
             with torch.cuda.stream(self._comm_stream):
