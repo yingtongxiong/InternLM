@@ -4,13 +4,13 @@ import subprocess
 
 name = "./configs/"
 # root_names = ["7B_train_", "13B_train_", "30B_train_"]
-root_names = ["13B_train_"]
+root_names = ["65B_train_"]
 # model_size = ["7B", "13B", "30B"]
-model_size = ["13B"]
-micro_bsz = [64]
-sp = ["flash-attn"]
-intern_overlap = [False]
-checkpoint = [True]
+model_size = ["65B"]
+micro_bsz = [1, 2, 4, 8]
+sp = ["none", "megatron", "flash-attn", "intern", "intern"]
+intern_overlap = [False, False, False, True, False]
+checkpoint = [False, True]
 
 for idx, root_name in enumerate(root_names):
     # 指定要创建的文件夹路径
