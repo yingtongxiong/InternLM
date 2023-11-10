@@ -129,6 +129,11 @@ class HybridZeroOptimizer(BaseOptimizer):
         if self._overlap_sync_param:
             assert self._param_bcast_sync_handler is not None
 
+        if gpc.config.parallel["tensor"]["sp"] == "intern" and gpc.config.parallel["tensor"]["intern_overlap"] is True:
+            self._fstp_handler = gpc.fstp_handler
+        else:
+            self._fstp_handler = None
+
         # iterate over the param group in the optimizer
         # partition these param groups for data parallel training
         # and add buffers to parameter store for future access
@@ -216,8 +221,7 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         # reduction hook is only used if overlapping communication
         # if it is stage 1 without overlapping, no hook will be attached
-        if self._overlap_sync_grad:
-            self._attach_reduction_hook()
+        self._attach_reduction_hook()
 
     @property
     def zero_local_rank(self):
@@ -284,52 +288,79 @@ class HybridZeroOptimizer(BaseOptimizer):
             param_group = self._fp16_param_groups[group_id]
             for param in param_group:
                 # we should not reduce the param in moe
-                if param.requires_grad:
-                    reduce_rank = None
+                if not param.requires_grad:
+                    continue
 
-                    def _define_and_attach(param, reduce_rank=None):
-                        # get the AccumulateGrad object of the param itself
-                        # If these objects are not kept, reduction hooks may not be attached successfully.
-                        accum_grad_obj = get_grad_accumulate_object(param)
-                        self._grad_store.add_accumulate_grad_object(accum_grad_obj)
+                reduce_rank = None
 
-                        reduction_func = partial(
-                            self._store_and_try_reduce_grads_by_bucket,
-                            param=param,
-                            reduce_rank=reduce_rank,
+                def _define_and_attach(param, reduce_rank=None):
+                    reduction_func = partial(
+                        self._store_and_try_reduce_grads_by_bucket,
+                        param=param,
+                        reduce_rank=reduce_rank,
+                    )
+
+                    reduce_scatter_checker = partial(
+                        self._wait_reduce_scatter_and_accumulate_grads,
+                        param=param,
+                        reduce_rank=reduce_rank,
+                    )
+
+                    def reduction_sp_func():
+                        handle = reduce_tensor(
+                            param.grad,
+                            dtype=None,
+                            dst_rank=reduce_rank,
+                            parallel_mode=ParallelMode.TENSOR,
                         )
+                        handle.wait()
 
-                        def reduction_sp_func():
-                            handle = reduce_tensor(
-                                param.grad,
-                                dtype=None,
-                                dst_rank=reduce_rank,
-                                parallel_mode=ParallelMode.TENSOR,
-                            )
-                            handle.wait()
+                    # define hook
+                    # NOT IMPORTANT BUT GOOD TO KNOW:
+                    # args here is not grad, but allow_unreacable and accumulate_grad
+                    def reduce_grad_hook(*args):  # pylint: disable=W0613
+                        if self.skip_grad_reduce is False:
+                            reduction_func()
 
-                        # define hook
-                        # NOT IMPORTANT BUT GOOD TO KNOW:
-                        # args here is not grad, but allow_unreacable and accumulate_grad
-                        def reduce_grad_hook(*args):  # pylint: disable=W0613
-                            if self.skip_grad_reduce is False:
-                                reduction_func()
+                    # define hook for real gradient accumulation.
+                    def accum_grad_hook(*args):  # pylint: disable=W0613
+                        reduce_scatter_checker()
 
-                        # define hook for sequence_parallel
-                        def reduce_grad_hook_sp(*args):  # pylint: disable=W0613
-                            if self.skip_grad_reduce is False:
-                                reduction_sp_func()
+                    # define hook for sequence_parallel
+                    def reduce_grad_hook_sp(*args):  # pylint: disable=W0613
+                        if self.skip_grad_reduce is False:
+                            reduction_sp_func()
 
-                        # if sequence_parallel is True,
-                        # the grad of norm should be all-reduce across the tp process group
-                        if gpc.config.parallel.sequence_parallel is True:
-                            if hasattr(param, IS_SEQUENCE_PARALLEL) and getattr(param, IS_SEQUENCE_PARALLEL) is True:
-                                accum_grad_obj_sp = get_grad_accumulate_object(param)
-                                accum_grad_obj_sp.register_hook(reduce_grad_hook_sp)
+                    # get the AccumulateGrad object of the param itself
+                    # If these objects are not kept, reduction hooks may not be attached successfully.
+                    accum_grad_obj = get_grad_accumulate_object(param)
+                    self._grad_store.add_accumulate_grad_object(accum_grad_obj)
 
+                    # if sequence_parallel is True,
+                    # the grad of norm should be all-reduce across the tp process group
+                    if (
+                        gpc.config.parallel.sequence_parallel is True
+                        and hasattr(param, IS_SEQUENCE_PARALLEL)
+                        and getattr(param, IS_SEQUENCE_PARALLEL) is True
+                    ):
+                        accum_grad_obj.register_hook(reduce_grad_hook_sp)
+
+                    # we should not only register for parameters which have _fstp_reduce_scatter_str attr.
+                    # we must keep up with reduce_grad_hook.
+                    if self._fstp_handler is not None:
+                        accum_grad_obj.register_hook(accum_grad_hook)
+
+                    if self._overlap_sync_grad:
                         accum_grad_obj.register_hook(reduce_grad_hook)
 
-                    _define_and_attach(param, reduce_rank)
+                _define_and_attach(param, reduce_rank)
+
+    def accumulate_left_grads_after_backward(self):
+        if self._fstp_handler is None:
+            return
+
+        for group_id in range(self.num_param_groups):
+            self._accum_grads_store_in_bucket(self._accum_grad_buckets[group_id])
 
     def belongs_to_current_rank(self, param) -> bool:
         """
@@ -344,6 +375,39 @@ class HybridZeroOptimizer(BaseOptimizer):
         tensor_rank = self._param_store.get_param_rank(param)
         group_id = getattr(param, "group_id")
         return tensor_rank == gpc.get_local_rank(self._broadcast_parallel_mode[group_id])
+
+    def _accum_grads_store_in_bucket(self, bucket: BucketStore, reduce_rank: Optional[int] = None) -> None:
+        for _param in bucket.get_param(reduce_rank):
+            if not hasattr(_param, "_fstp_reduce_scatter_str"):
+                continue
+
+            # wait and accumulate gardient.
+            _key = getattr(_param, "_fstp_reduce_scatter_str")
+            _comm_handle, _grad = self._fstp_handler.reduce_scatter_handlers[_key]
+            _comm_handle.wait()
+            _param.grad.add_(_grad)
+
+            # release cuda memory.
+            self._fstp_handler.release_reduce_scatter_memory(key=tuple(_grad.size()), index=_grad.index)
+            self._fstp_handler.reduce_scatter_handlers[_key] = None
+
+        bucket.reset_by_rank(reduce_rank)
+
+    def _wait_reduce_scatter_and_accumulate_grads(self, param, reduce_rank: Optional[int] = None):
+        param_size = param.numel()
+
+        group_id = getattr(param, "group_id")
+        current_bucket = self._accum_grad_buckets[group_id]
+
+        # check if the bucket is full
+        # if full, will reduce the grads already in the bucket
+        # after reduction, the bucket will be empty
+        if current_bucket.num_elements_in_bucket(reduce_rank) + param_size > self._reduce_bucket_size:
+            self._accum_grads_store_in_bucket(current_bucket, reduce_rank)
+
+        # otherwise, add the parameter into bucket.
+        current_bucket.add_num_elements_in_bucket(param_size, reduce_rank)
+        current_bucket.add_param(param, reduce_rank)
 
     def _store_and_try_reduce_grads_by_bucket(self, param, reduce_rank=None):
         param_size = param.numel()
