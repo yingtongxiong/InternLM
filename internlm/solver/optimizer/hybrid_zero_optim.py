@@ -3,7 +3,7 @@
 
 import math
 from functools import partial
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
