@@ -2,7 +2,7 @@
 # -*- encoding: utf-8 -*-
 
 import collections
-from typing import Deque, Optional
+from typing import Callable, Optional
 
 import fused_dense_lib as fused_dense_cuda
 import torch
@@ -16,10 +16,62 @@ from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.utils.logger import get_logger
 
-comm_queue: Deque = collections.deque()
+
+class SmartLasyCommunicator:
+
+    def __init__(self) -> None:
+        self._closures = collections.deque()
+        
+        self._ready = False
+        self._is_forward = True
+        self._is_forward_first = True
+        self._triggered_idx = 0
+        self._max_triggered_num = 5
+        self._trigger_conf = {
+            # forward sched: before_wqkv_ag: 1, wqkv_ag: 2,
+            # out_proj_rs: 0, w1_ag: 0, w2_ag: 1, w3_rs: 1.
+            True: [2, 0, 0, 1, 1],
+            # backward sched: w3_ag: 2, w2_rs: 1, w1_rs: 0,
+            # out_proj_ag: 2, wqkv_rs: 0.
+            False: [2, 1, 0, 2, 0],
+        }
+
+    def set_forward_mode(self, is_forward: bool = True) -> None:
+        self._is_forward = is_forward
+        if is_forward:
+            self._is_forward_first = True
+    
+    def add(self, closure: Callable) -> None:
+        if self._is_forward and self._is_forward_first:
+            closure()
+            self._is_forward_first = False
+        else:
+            self._closures.append(closure)
+            # if gpc.get_global_rank() == 0:
+            #     print(f"### add a comm [{len(self._closures)}] in forward mode [{self._is_forward}]", flush=True)
+
+        self._ready = True
+    
+    def trigger(self) -> None:
+        if not self._ready:
+            return
+
+        triggered_num = self._trigger_conf[self._is_forward][self._triggered_idx]
+        # if gpc.get_global_rank() == 0:
+        #     print(f"### commit {triggered_num} comm in forward_mode [{self._is_forward}]", flush=True)
+        for i in range(triggered_num):
+            self._closures.popleft()()
+
+        if self._triggered_idx + 1 == self._max_triggered_num:
+            self._triggered_idx = 0
+            self._ready = False
+        else:
+            self._triggered_idx += 1
+
+
 
 logger = get_logger(__file__)
-
+comm_queue = SmartLasyCommunicator()
 
 def _split(input_, parallel_mode, dim=-1):
     # skip if only one rank involved
@@ -195,14 +247,13 @@ class ReduceScatterFuncHack(torch.autograd.Function):
     def forward(ctx, input_: Tensor, process_group: ProcessGroup) -> Tensor:
         ctx.process_group = process_group
         output, _ = reduce_scatter_raw(input_, process_group)
+        comm_queue.trigger()
         return output
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         grad_input, _ = all_gather_raw(grad_output, ctx.process_group)
-        while comm_queue:
-            comm = comm_queue.popleft()
-            comm()
+        comm_queue.trigger()
         return grad_input, None
 
 
@@ -318,12 +369,15 @@ class MegatronFusedDenseFunc(torch.autograd.Function):
         ctx.process_group = process_group
         ctx.sequence_parallel = sequence_parallel
 
+        _trigger_comm_queue = False
+
         if torch.is_autocast_enabled():
             x = x.to(dtype=torch.get_autocast_gpu_dtype())
         x = x.contiguous()
         if process_group is not None and sequence_parallel:
             # We want to kick off the all_gather early, before weight dtype conversion
             total_x, handle_x = all_gather_raw(x, process_group, async_op=True, gather_dim=gather_dim)
+            _trigger_comm_queue = True
         else:
             total_x = x
 
@@ -339,6 +393,8 @@ class MegatronFusedDenseFunc(torch.autograd.Function):
         if min(batch_dim, n, *weight.shape) > 65535 * 32:
             raise RuntimeError("fused_dense only supports matrix dims <= 2M")
         output = F.linear(total_x, weight, bias)
+        if _trigger_comm_queue:
+            comm_queue.trigger()
         if ctx.compute_weight_gradient:
             ctx.save_for_backward(total_x, weight)
         else:
@@ -354,6 +410,8 @@ class MegatronFusedDenseFunc(torch.autograd.Function):
             grad_input = grad_input.contiguous()
         process_group = ctx.process_group
         sequence_parallel = ctx.sequence_parallel
+
+        _trigger_comm_queue = False
 
         if ctx.compute_weight_gradient:
             total_x, weight = ctx.saved_tensors
@@ -371,6 +429,8 @@ class MegatronFusedDenseFunc(torch.autograd.Function):
             grad_input = grad_input.reshape(*batch_shape, grad_input.shape[-1])
             if process_group is not None:
                 reduce_fn = reduce_scatter_raw if sequence_parallel else all_reduce_raw
+                _trigger_comm_queue = True
+
                 grad_input, handle_grad_input = reduce_fn(grad_input, process_group, async_op=True)
         else:
             grad_input = None
@@ -382,6 +442,8 @@ class MegatronFusedDenseFunc(torch.autograd.Function):
         else:
             grad_weight = None
             grad_bias = grad_output if ctx.needs_input_grad[2] else None
+        if _trigger_comm_queue:
+            comm_queue.trigger()
         if process_group is not None and ctx.needs_input_grad[0]:
             handle_grad_input.wait()
         return grad_input, grad_weight, grad_bias, None, None, None, None

@@ -347,6 +347,7 @@ class MegatronFeedForward(BaseFeedForward):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         multiple_of: int = 256,
+        reorder_bwd_comm: bool = False,
     ):
         super().__init__(
             in_features,
@@ -358,7 +359,7 @@ class MegatronFeedForward(BaseFeedForward):
             dtype,
             multiple_of,
             MegatronColumnParallelLinearTorch,
-            MegatronRowParallelLinearTorch,
+            MegatronRowParallelLinearTorchReorderBwdComm if reorder_bwd_comm else MegatronRowParallelLinearTorch,
         )
 
 

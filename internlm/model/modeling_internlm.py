@@ -118,7 +118,9 @@ class PackedFlashBaseLayer1D(nn.Module):
 
         if use_swiglu:
             mlp_cls = get_mlp_cls(sp_mode)
-            self.mlp = mlp_cls(
+            if reorder_bwd_comm and sp_mode == "megatron":
+                # TODO: re-write
+                self.mlp = mlp_cls(
                 hidden_size,
                 int(hidden_size * mlp_ratio),
                 out_features=hidden_size,
@@ -126,7 +128,18 @@ class PackedFlashBaseLayer1D(nn.Module):
                 bias=False,
                 device=device,
                 dtype=dtype,
+                reorder_bwd_comm=reorder_bwd_comm,
             )
+            else:
+                self.mlp = mlp_cls(
+                    hidden_size,
+                    int(hidden_size * mlp_ratio),
+                    out_features=hidden_size,
+                    process_group=gpc.get_group(ParallelMode.TENSOR),
+                    bias=False,
+                    device=device,
+                    dtype=dtype,
+                )
         else:
             self.mlp = ParallelFusedMLP(
                 hidden_size,
