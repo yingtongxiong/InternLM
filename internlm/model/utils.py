@@ -17,46 +17,57 @@ from internlm.core.context import global_context as gpc
 from internlm.utils.logger import get_logger
 
 
-class SmartLasyCommunicator:
+class SmartLazyCommunicator:
 
     def __init__(self) -> None:
         self._closures = collections.deque()
         
+        self._hybrid_ratio = 2
         self._ready = False
         self._is_forward = True
-        self._is_forward_first = True
+        self._is_forward_first = 3
         self._triggered_idx = 0
-        self._max_triggered_num = 5
+        self._max_triggered_num = 5 * (self._hybrid_ratio - 1)
         self._trigger_conf = {
-            # forward sched: before_wqkv_ag: 1, wqkv_ag: 2,
-            # out_proj_rs: 0, w1_ag: 0, w2_ag: 1, w3_rs: 1.
-            True: [2, 0, 0, 1, 1],
-            # backward sched: w3_ag: 2, w2_rs: 1, w1_rs: 0,
-            # out_proj_ag: 2, wqkv_rs: 0.
-            False: [2, 1, 0, 2, 0],
-        }
+            2:{
+                # forward sched: before_wqkv_ag: 1, wqkv_ag: 2,
+                # out_proj_rs: 0, w1_ag: 0, w2_ag: 1, w3_rs: 1.
+                True: [1, 0, 0, 0, 1],
+                # backward sched: w3_ag: 2, w2_rs: 1, w1_rs: 0,
+                # out_proj_ag: 2, wqkv_rs: 0.
+                False: [2, 1, 0, 2, 0],
+            },
+            3:{
+                True: [1, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                False: [1, 1, 0, 1, 0, 1, 0, 0, 1, 0],
+            }}
+    
+    def set_hybrid_ratio(self, ratio: int):
+        self._hybrid_ratio = ratio
+        self._max_triggered_num = 5 * (self._hybrid_ratio - 1)
+        
 
     def set_forward_mode(self, is_forward: bool = True) -> None:
         self._is_forward = is_forward
         if is_forward:
-            self._is_forward_first = True
+            self._is_forward_first = 3
     
     def add(self, closure: Callable) -> None:
-        if self._is_forward and self._is_forward_first:
+        if self._is_forward and self._is_forward_first > 0:
             closure()
-            self._is_forward_first = False
+            self._is_forward_first -= 1
         else:
             self._closures.append(closure)
-            # if gpc.get_global_rank() == 0:
-            #     print(f"### add a comm [{len(self._closures)}] in forward mode [{self._is_forward}]", flush=True)
+        # if gpc.get_global_rank() == 0:
+        #     print(f"### add a comm [{len(self._closures)}] in forward mode [{self._is_forward}]", flush=True)
 
-        self._ready = True
+        # self._ready = True
     
     def trigger(self) -> None:
         if not self._ready:
             return
 
-        triggered_num = self._trigger_conf[self._is_forward][self._triggered_idx]
+        triggered_num = self._trigger_conf[self._hybrid_ratio][self._is_forward][self._triggered_idx]
         # if gpc.get_global_rank() == 0:
         #     print(f"### commit {triggered_num} comm in forward_mode [{self._is_forward}]", flush=True)
         for i in range(triggered_num):
@@ -71,7 +82,7 @@ class SmartLasyCommunicator:
 
 
 logger = get_logger(__file__)
-comm_queue = SmartLasyCommunicator()
+comm_queue = SmartLazyCommunicator()
 
 def _split(input_, parallel_mode, dim=-1):
     # skip if only one rank involved

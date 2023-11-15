@@ -363,6 +363,7 @@ class PackedFlashInternLm1D(nn.Module):
                 normal_(std=0.0052)(param)
                 if gpc.get_world_size(ParallelMode.TENSOR) > 1:
                     setattr(param, IS_TENSOR_PARALLEL, True)
+        self.hybrid_ratio = 3 if gpc.config.SEQ_LEN == 4096 else 2
         self.embed_grad_scale = embed_grad_scale
         self.blocks = nn.ModuleList(
             [
@@ -385,7 +386,7 @@ class PackedFlashInternLm1D(nn.Module):
                     use_scaled_init=use_scaled_init,
                     use_swiglu=use_swiglu,
                     use_flash_attn=use_flash_attn,
-                    sp_mode="intern" if lid % 2 == 0 else self.sp_mode,
+                    sp_mode="intern" if lid % self.hybrid_ratio == 0 else self.sp_mode,
                     reorder_bwd_comm=self.reorder_bwd_comm,
                 )
                 for lid in range(num_layers)

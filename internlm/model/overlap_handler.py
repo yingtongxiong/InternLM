@@ -45,6 +45,8 @@ class FSTPOverlapHandler:
         self.chunks = []
         self.model_checkpoint = gpc.config.model.checkpoint
         self.is_forward = True
+        self.hybrid_ratio = 3 if gpc.config.SEQ_LEN == 4096 else 2
+        comm_queue.set_hybrid_ratio(self.hybrid_ratio)
 
         self.reduce_scatter_handlers = {}
         self.zero_const_pool = {}
@@ -86,7 +88,7 @@ class FSTPOverlapHandler:
 
                 for idx, block in enumerate(children):
                     # only process block with intern sp mode
-                    if idx % 2 == 1:
+                    if idx % self.hybrid_ratio != 0:
                         continue
 
                     self.index_to_fstp_modules[intern_idx] = []
@@ -120,7 +122,7 @@ class FSTPOverlapHandler:
         self.module_shape["Wqkv"] = (3 * hidden_size, hidden_size)
         self.module_shape["out_proj"] = (hidden_size, hidden_size)
         self.module_shape["w1"] = (mlp_hidden_size, hidden_size)
-        self.module_shape["w2"] = (mlp_hidden_size, hidden_size)
+        self.module_shape["w2"] = (mlp_hidden_size, hidden_size)##
         self.module_shape["w3"] = (hidden_size, mlp_hidden_size)
 
     def _initialize_memory_pool(self) -> None:
@@ -212,6 +214,7 @@ class FSTPOverlapHandler:
             self.fstp_global_handle[_module] = weight_handle
 
         fstp_modules = self.index_to_fstp_modules[block_index]
+        
         for module in fstp_modules:
             if queue is None:
                 _comm_func(module)
@@ -251,7 +254,7 @@ class FSTPOverlapHandler:
                 # start the all-gather for next block
                 if block_index + 1 < self.num_blocks:
                     if self.reorder_bwd_comm:
-                        comm_queue._is_forward_first = True
+                        comm_queue._is_forward_first = 3
                         self._all_gather_block_weight_memory_pool(block_index+1, comm_queue)
                         comm_queue._ready = True
                     else:
@@ -259,7 +262,7 @@ class FSTPOverlapHandler:
             else:
                 if block_index - 1 >= 0:
                     if self.reorder_bwd_comm:
-                        comm_queue._is_forward_first = True
+                        comm_queue._is_forward_first = 3
                         self._all_gather_block_weight_memory_pool(block_index-1, comm_queue)
                         comm_queue._ready = True
                     else:
