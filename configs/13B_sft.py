@@ -1,7 +1,7 @@
 JOB_NAME = "13b_train"
 DO_ALERT = False
 
-SEQ_LEN = 4096
+SEQ_LEN = 65536
 HIDDEN_SIZE = 5120
 NUM_ATTENTION_HEAD = 40
 MLP_RATIO = 8 / 3
@@ -49,14 +49,14 @@ VALID_FOLDER = "/path/to/dataset"
 data = dict(
     seq_len=SEQ_LEN,
     # micro_num means the number of micro_batch contained in one gradient update
-    micro_num=4,
+    micro_num=1,
     # packed_length = micro_bsz * SEQ_LEN
-    micro_bsz=2,
+    micro_bsz=1,
     # defaults to the value of micro_num
     valid_micro_num=4,
     # defaults to 0, means disable evaluate
     valid_every=50,
-    pack_sample_into_one=False,
+    pack_sample_into_one=True,
     total_steps=20,
     skip_batches="",
     rampup_batch_size="",
@@ -90,7 +90,7 @@ grad_scaler = dict(
 hybrid_zero_optimizer = dict(
     # Enable low_level_optimzer overlap_communication
     overlap_sync_grad=True,
-    overlap_sync_param=True,
+    overlap_sync_param=False,
     # bucket size for nccl communication params
     reduce_bucket_size=512 * 1024 * 1024,
     # grad clipping
@@ -125,7 +125,7 @@ beta2_scheduler = dict(
 )
 
 model = dict(
-    checkpoint=False,  # The proportion of layers for activation aheckpointing, the optional value are True/False/[0-1]
+    checkpoint=True,  # The proportion of layers for activation aheckpointing, the optional value are True/False/[0-1]
     num_attention_heads=NUM_ATTENTION_HEAD,
     embed_split_hidden=True,
     vocab_size=VOCAB_SIZE,
@@ -162,9 +162,8 @@ sequence parallel (bool): enable/disable sequence parallel, defaults to False.
 """
 parallel = dict(
     zero1=dict(size=-1, fsdp=False),
-    tensor=dict(size=8, mode="origin_tp"),
+    tensor=dict(size=8, sp="intern", intern_overlap=True, memory_pool=False),
     pipeline=dict(size=1, interleaved_overlap=True),
-    sequence_parallel=True,
 )
 
 cudnn_deterministic = False

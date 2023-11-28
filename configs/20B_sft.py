@@ -49,22 +49,22 @@ VALID_FOLDER = "/path/to/dataset"
 data = dict(
     seq_len=SEQ_LEN,
     # micro_num means the number of micro_batch contained in one gradient update
-    micro_num=4,
+    micro_num=1,
     # packed_length = micro_bsz * SEQ_LEN
-    micro_bsz=2,
+    micro_bsz=1,
     # defaults to the value of micro_num
     valid_micro_num=4,
     # defaults to 0, means disable evaluate
-    valid_every=50,
-    pack_sample_into_one=False,
-    total_steps=20,
+    valid_every=500,
+    pack_sample_into_one=True,
+    total_steps=100,
     skip_batches="",
     rampup_batch_size="",
     # Datasets with less than 50 rows will be discarded
     min_length=50,
     # train_folder=TRAIN_FOLDER,
     # valid_folder=VALID_FOLDER,
-    empty_cache_and_diag_interval=10,
+    empty_cache_and_diag_interval=100,
     diag_outlier_ratio=1.1,
 )
 
@@ -90,7 +90,7 @@ grad_scaler = dict(
 hybrid_zero_optimizer = dict(
     # Enable low_level_optimzer overlap_communication
     overlap_sync_grad=True,
-    overlap_sync_param=True,
+    overlap_sync_param=False,
     # bucket size for nccl communication params
     reduce_bucket_size=512 * 1024 * 1024,
     # grad clipping
@@ -161,10 +161,9 @@ pipeline parallel (dict):
 sequence parallel (bool): enable/disable sequence parallel, defaults to False.
 """
 parallel = dict(
-    zero1=dict(size=-1, fsdp=False),
-    tensor=dict(size=8, mode="fstp", overlap=True),
+    zero1=dict(size=-1, fsdp=True),
+    tensor=dict(size=1, sp="none", intern_overlap=False, memory_pool=False),
     pipeline=dict(size=1, interleaved_overlap=True),
-    sequence_parallel=True,
 )
 
 cudnn_deterministic = False

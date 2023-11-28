@@ -11,6 +11,7 @@ import torch
 
 from internlm.core.context import Config
 from internlm.core.context import global_context as gpc
+from internlm.core.context.process_group_initializer import ParallelMode
 from internlm.monitor import initialize_light_monitor
 from internlm.utils.common import get_master_node
 from internlm.utils.logger import get_logger
@@ -435,6 +436,9 @@ def launch(
                 f"expert parallel size: {gpc.expert_parallel_size} | "
                 f"number of local experts: {gpc.config.model.num_experts//gpc.expert_parallel_size}"
             )
+    logger.info(
+        f"global_rank:{gpc.get_global_rank()} dp_rank:{gpc.get_local_rank(ParallelMode.DATA)} tp_rank:{gpc.get_local_rank(ParallelMode.TENSOR)} zero3.5_rank:{gpc.get_local_rank(ParallelMode.ZERO1)}"
+    )
 
 
 def launch_from_slurm(

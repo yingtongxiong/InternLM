@@ -2,7 +2,7 @@
 DO_ALERT = False
 
 SEQ_LEN = {seq_len}
-JOB_NAME = "13b_train_" + str(SEQ_LEN) + "_" + str({sp}) + "_" + str({intern_overlap}) + "_" + str({checkpoint})
+JOB_NAME = "13b_train_" + str(SEQ_LEN) + "_" + str({sp}) + "_" + str({intern_overlap}) + "_" + str({checkpoint}) + "_" + str({memory_pool})
 HIDDEN_SIZE = 5120
 NUM_ATTENTION_HEAD = 40
 MLP_RATIO = 8 / 3
@@ -56,9 +56,9 @@ data = dict(
     # defaults to the value of micro_num
     valid_micro_num=4,
     # defaults to 0, means disable evaluate
-    valid_every=50,
+    valid_every=500,
     pack_sample_into_one=True,
-    total_steps=20,
+    total_steps=100,
     skip_batches="",
     rampup_batch_size="",
     # Datasets with less than 50 rows will be discarded
@@ -163,7 +163,7 @@ sequence parallel (bool): enable/disable sequence parallel, defaults to False.
 """
 parallel = dict(
     zero1=dict(size=-1, fsdp=False),
-    tensor=dict(size=8, sp={sp}, intern_overlap={intern_overlap}),
+    tensor=dict(size=8, sp={sp}, intern_overlap={intern_overlap}, memory_pool={memory_pool}),
     pipeline=dict(size=1, interleaved_overlap=True),
 )
 
