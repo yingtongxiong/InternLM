@@ -5,7 +5,7 @@ import copy
 import functools
 import time
 from functools import partial
-from typing import Callable, Iterable, Union
+from typing import Callable, Iterable, Union, Any
 
 import torch
 import torch.distributed as dist
@@ -42,7 +42,7 @@ from internlm.model.linear import (
     ScaleColumnParallelLinear,
 )
 from internlm.model.multi_head_attention import MHA
-from internlm.model.overlap_handler import FSTPOverlapHandler
+from internlm.model.overlap_handler import FSTPOverlapHandler, EmbeddingHookHandler
 from internlm.model.utils import try_import_RMSNorm
 from internlm.monitor import send_heartbeat, set_env_var
 from internlm.monitor.monitor import monitor_manager as mm
@@ -116,8 +116,14 @@ def initialize_model():
     # if fsdp enabled, wrap the model
     model = wrap_FSDP_model(model)
 
+    gpc.embed_handler = None
+    if gpc.config.parallel["weight"]["size"] > 1:
+        print(f"register embedding hook", flush=True)
+        gpc.embed_handler = EmbeddingHookHandler(model, gpc.get_group(ParallelMode.WEIGHT))
+        assert gpc.embed_handler is not None
+
     gpc.fstp_handler = None
-    if gpc.config.parallel["weight"]["size"] >= 1 and gpc.config.parallel["weight"]["overlap"] is True:
+    if gpc.config.parallel["weight"]["size"] > 1 and gpc.config.parallel["weight"]["overlap"] is True:
         gpc.fstp_handler = FSTPOverlapHandler(model, gpc.get_group(ParallelMode.WEIGHT))
 
     return model

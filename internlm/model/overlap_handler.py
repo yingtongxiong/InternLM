@@ -11,11 +11,14 @@ from internlm.core.context import global_context as gpc
 from internlm.core.naive_amp import NaiveAMPModel
 from internlm.core.scheduler import SchedulerHook
 from internlm.model.embedding import Embedding1D
-from internlm.model.linear import FSTPLinear, ScaleColumnParallelLinear
+from internlm.model.linear import FSTPLinear, ScaleColumnParallelLinear, FSTPScaleColumnParallelLinear
 from internlm.model.utils import (
     all_gather_raw,
     all_gather_raw_bias_memory_pool,
     all_gather_raw_memory_pool,
+    _gather,
+    _split,
+    reduce_scatter_raw,
 )
 from internlm.utils.common import get_current_device
 
@@ -55,8 +58,11 @@ class FSTPOverlapHandler:
                 _chunk = _chunk.model
 
             for _chunk_name, children in _chunk.named_children():
-                if isinstance(children, ScaleColumnParallelLinear):
+                if isinstance(children, FSTPScaleColumnParallelLinear):
                     setattr(children, "_fstp_name", "head")
+                    setattr(children.weight, "_fstp_reduce_scatter_str", f"head.weight")
+                    if children.bias is not None:
+                        setattr(children.bias, "_fstp_reduce_scatter_str", f"head.bias")
                     self.head.append(children)
                 elif isinstance(children, Embedding1D):
                     self.embedding.append(children)
@@ -165,13 +171,20 @@ class FSTPOverlapHandler:
         return self.all_gather_bias_memory_pool[block_index % 2][module._fstp_name]
 
     def get_weight_all_gather(self, module):
-        if self.enable_memory_pool:
+        # try:
+        if self.enable_memory_pool and getattr(module, "_fstp_name") != "head":
             return self._get_weight_from_memory_pool(module)
         else:
             return self.weight_global_output[module]
+        # except KeyError:
+
+        # import pdb
+
+        # if gpc.get_global_rank() == 0:
+        #     pdb.set_trace()
 
     def get_bias_all_gather(self, module):
-        if self.enable_memory_pool:
+        if self.enable_memory_pool and getattr(module, "_fstp_name") != "head":
             return self._get_bias_from_memory_pool(module)
         else:
             return self.bias_global_output[module]
@@ -202,7 +215,7 @@ class FSTPOverlapHandler:
         self.reduce_scatter_memory_pool[key][index].idle = True
 
     def _all_gather_module_weight(self, module):
-        if self.enable_memory_pool:
+        if self.enable_memory_pool and getattr(module, "_fstp_name") != "head":
             if module.bias is not None:
                 bias_handle = all_gather_raw_bias_memory_pool(
                     module.bias,
@@ -291,6 +304,16 @@ class FSTPOverlapHandler:
                 self._all_gather_module_weight(module)
                 _wait_handle(module)
 
+        def _pre_hook_for_head(module: nn.Module, inputs: Any):  # pylint: disable=W0613
+            if module not in self.weight_global_handle:
+                self._all_gather_module_weight(module)
+
+            _wait_handle(module)
+
+        def _post_hook_for_head(module, grad_input, grad_output):  # pylint: disable=W0613
+            _clear_handle(module)
+            _clear_weight(module)
+
         def _post_forward_hook_for_module(module: nn.Module, inputs: Any, output: Any):  # pylint: disable=W0613
             _clear_handle(module)
             if not self.model_checkpoint:
@@ -343,6 +366,12 @@ class FSTPOverlapHandler:
             module.register_forward_pre_hook(_pre_forward_hook_for_module)
             module.register_forward_hook(_post_forward_hook_for_module)
 
+        for head in self.head:
+            head.register_forward_pre_hook(_pre_hook_for_head)
+            head.register_full_backward_pre_hook(_pre_hook_for_head)
+            head.register_forward_hook(_post_hook_for_head)
+            head.register_full_backward_hook(_post_hook_for_head)
+
         # register backward hooks
         # 1. register post_backward_hook @head module to prefetch for the last block's last module
         # 2. register pre_backward_hook @fstp_module to wait handle for current module and to prefetch for next module
@@ -356,6 +385,91 @@ class FSTPOverlapHandler:
 
         for module in self.fstp_modules:
             module.register_full_backward_hook(_post_backward_hook_for_module)
+
+
+class EmbeddingHookHandler:
+    """
+    Handler for register hooks for embedding module.
+    """
+
+    def __init__(self, model: Union[nn.Module, nn.ModuleList], process_group) -> None:
+        self.process_group = process_group
+        self.embedding = None
+        self.params_to_grads = {}
+
+        if not isinstance(model, nn.ModuleList):
+            model = [model]
+        for _chunk in model:
+            if isinstance(_chunk, NaiveAMPModel):
+                _chunk = _chunk.model
+
+            for _, children in _chunk.named_children():
+                if isinstance(children, Embedding1D):
+                    self.embedding = children
+                    break
+
+        self._register_hook_for_embedding()
+
+    def add_param_grad(self, param: torch.Tensor, grad: torch.Tensor):
+        if param not in self.params_to_grads:
+            self.params_to_grads[param] = grad
+        else:
+            self.params_to_grads[param].add_(grad)
+
+    def get_param_grad(self, param: torch.Tensor):
+        assert param in self.params_to_grads
+        return self.params_to_grads[param]
+
+    def split_weight_post_accum_grad(self):
+        split_weight = _split(self.embedding.weight, ParallelMode.WEIGHT, dim=-1)
+        self.embedding.weight.data = split_weight
+
+    def _register_hook_for_embedding(self):
+        # 1. pre backward之前把grad设置为None
+        # 2. post backward时把当前的grad进行reduce scatter更新，累加到全局变量里，然后将更新后的全局变量赋值给grad
+        # 3. step之前清空全局变量
+
+        def _pre_hook_forward_gather_weight(module: nn.Module, inputs: Any):
+            print(f"ht debug before forward allgather weight.shape:{module.weight.shape}", flush=True)
+            total_weight, _ = all_gather_raw(module.weight, gpc.get_group(ParallelMode.WEIGHT), gather_dim=-1)
+            module.weight.data = total_weight
+            print(f"ht debug after forward allgather weight.grad_fn:{module.weight.grad_fn}", flush=True)
+            print(f"ht debug after forward allgather weight.shape:{module.weight.shape}", flush=True)
+            print(f"ht debug after forward allgather data.shape:{module.weight.data.shape}", flush=True)
+            for name, param in module.named_parameters():
+                print(f"ht debug after forward allgather name:{name} param.shape:{param.shape}", flush=True)
+
+        def _pre_hook_backward_gather_weight(module: nn.Module, grad_output):
+            print(f"ht debug before backward allgather weight.grad_fn:{module.weight.grad_fn}", flush=True)
+            print(f"ht debug before backward allgather weight.shape:{module.weight.shape}", flush=True)
+            total_weight, _ = all_gather_raw(module.weight, gpc.get_group(ParallelMode.WEIGHT), gather_dim=-1)
+            module.weight.data = total_weight
+            print(f"ht debug after backward allgather weight.grad_fn:{module.weight.grad_fn}", flush=True)
+            print(f"ht debug after backward allgather weight.shape:{module.weight.shape}", flush=True)
+            print(f"ht debug after backward allgather data.shape:{module.weight.data.shape}", flush=True)
+            for name, param in module.named_parameters():
+                print(f"ht debug after backward allgather name:{name} param.shape:{param.shape}", flush=True)
+
+        def _post_hook_forward_split_weight(module: nn.Module, inputs: Any, output: Any):
+            print(f"ht debug before forward split weight.shape:{module.weight.shape}", flush=True)
+            split_weight = _split(module.weight, ParallelMode.WEIGHT, dim=-1)
+            module.weight.data = split_weight
+            print(f"ht debug after forward split weight.grad_fn:{module.weight.grad_fn}", flush=True)
+            print(f"ht debug after forward split weight.shape:{module.weight.shape}", flush=True)
+            print(f"ht debug after forward split data.shape:{module.weight.data.shape}", flush=True)
+            for name, param in module.named_parameters():
+                print(f"ht debug after forward split name:{name} param.shape:{param.shape}", flush=True)
+
+        def _post_hook_backward_split_weight(module: nn.Module, grad_input, grad_output):
+            print(f"111 post backward hook for embedding", flush=True)
+            split_weight = _split(module.weight, ParallelMode.WEIGHT, dim=-1)
+            module.weight.data = split_weight
+
+        assert self.embedding is not None
+        self.embedding.register_forward_pre_hook(_pre_hook_forward_gather_weight)
+        self.embedding.register_full_backward_pre_hook(_pre_hook_backward_gather_weight)
+        self.embedding.register_forward_hook(_post_hook_forward_split_weight)
+        # self.embedding.register_full_backward_hook(_post_hook_backward_split_weight)
 
 
 class FSTPOverlapSchedulerHook(SchedulerHook):

@@ -2,7 +2,7 @@
 # -*- encoding: utf-8 -*-
 
 import math
-from typing import Optional
+from typing import Optional, Any
 
 import torch
 from flash_attn.modules.embedding import ParallelGPT2Embeddings
@@ -17,6 +17,7 @@ from internlm.model.linear import (
     MegatronScaleColumnParallelLinear,
     RewardModelLinear,
     ScaleColumnParallelLinear,
+    FSTPScaleColumnParallelLinear,
     get_mlp_cls,
 )
 from internlm.model.multi_head_attention import MHA
@@ -30,6 +31,7 @@ from internlm.utils.checkpoint import activation_checkpoint
 from internlm.utils.common import filter_kwargs
 from internlm.utils.logger import get_logger
 from internlm.utils.registry import MODEL_INITIALIZER
+from internlm.model.utils import all_gather_raw, _split
 
 
 MODEL_TYPE = "INTERNLM"
@@ -327,14 +329,19 @@ class PackedFlashInternLm1D(nn.Module):
         if is_reward:
             head_cls = RewardModelLinear
         else:
-            head_cls = (
-                ScaleColumnParallelLinear
-                if self.sp_mode in ["flash-attn", "none", "intern"]
-                else MegatronScaleColumnParallelLinear
-            )
+            # head_cls = (
+            #     ScaleColumnParallelLinear
+            #     if self.sp_mode in ["flash-attn", "none", "intern"]
+            #     else MegatronScaleColumnParallelLinear
+            # )
+            head_cls = FSTPScaleColumnParallelLinear
         if first:
             if embed_split_hidden:
-                self.embedding = Embedding1D(num_embeddings=vocab_size, embedding_dim=hidden_size)
+                self.embedding = Embedding1D(
+                    num_embeddings=vocab_size,
+                    embedding_dim=hidden_size,
+                    process_group=gpc.get_group(ParallelMode.WEIGHT),
+                )
             else:
                 self.embedding = ParallelGPT2Embeddings(
                     embed_dim=hidden_size,
@@ -346,12 +353,14 @@ class PackedFlashInternLm1D(nn.Module):
                     device=device,
                     dtype=dtype,
                 )
+
             for _, param in self.embedding.named_parameters():
                 normal_(std=0.0052)(param)
                 if gpc.get_world_size(ParallelMode.TENSOR) > 1:
                     setattr(param, IS_TENSOR_PARALLEL, True)
                 if gpc.get_world_size(ParallelMode.WEIGHT) > 1:
                     setattr(param, IS_WEIGHT_PARALLEL, True)
+                    setattr(param, "_fstp_name", "embedding")
         self.embed_grad_scale = embed_grad_scale
         self.blocks = nn.ModuleList(
             [
@@ -387,7 +396,7 @@ class PackedFlashInternLm1D(nn.Module):
             self.head = head_cls(
                 in_features=hidden_size,
                 out_features=gpc.get_world_size(ParallelMode.TENSOR) if is_reward else vocab_size,
-                process_group=gpc.get_group(ParallelMode.SEQUENCE),
+                process_group=gpc.get_group(ParallelMode.WEIGHT),
                 bias=False,
                 device=device,
                 dtype=dtype,
@@ -458,6 +467,8 @@ class PackedFlashInternLm1D(nn.Module):
             #     f"ht debug head rank:{gpc.get_global_rank()} hidden_states.shape:{hidden_states.shape} hidden_states:{hidden_states}",
             #     flush=True,
             # )
+
+        hidden_states = gather_forward_split_backward(hidden_states, ParallelMode.SEQUENCE, dim=0)
 
         if not self.parallel_output:
             hidden_states = gather_forward_split_backward(hidden_states, ParallelMode.TENSOR, dim=-1)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
-from typing import Tuple
+from typing import Tuple, Optional
 
 import rotary_emb
 import torch
@@ -14,7 +14,7 @@ from torch import Tensor, nn
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 
-from .utils import gather_forward_split_backward, split_forward_gather_backward
+from .utils import all_gather_raw, gather_forward_split_backward, split_forward_gather_backward
 
 
 class Embedding1D(nn.Module):
@@ -35,6 +35,7 @@ class Embedding1D(nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
         *args,
         padding_idx: int = None,
         dtype: torch.dtype = None,
@@ -44,7 +45,8 @@ class Embedding1D(nn.Module):
 
         self.num_embeddings = num_embeddings
         self.embed_dim = embedding_dim
-        embed_dim_per_partition = embedding_dim // gpc.sequence_parallel_size
+        self.process_group = process_group
+        embed_dim_per_partition = embedding_dim // gpc.weight_parallel_size
 
         self.padding_idx = padding_idx
         self.embed_args = args
@@ -53,16 +55,17 @@ class Embedding1D(nn.Module):
         self.weight = nn.Parameter(torch.empty((num_embeddings, embed_dim_per_partition), dtype=dtype))
 
     def forward(self, input_: Tensor) -> Tensor:
-        output_parallel = F.embedding(input_, self.weight, self.padding_idx, *self.embed_args, **self.embed_kwargs)
+        # with torch.no_grad():
+        input_ = split_forward_gather_backward(input_, ParallelMode.SEQUENCE, dim=1)
+        print(f"ht debug input.shape:{input_.shape}", flush=True)
+        output = F.embedding(input_, self.weight, self.padding_idx, *self.embed_args, **self.embed_kwargs)
 
-        output = gather_forward_split_backward(output_parallel, ParallelMode.SEQUENCE, dim=-1)
-
-        if gpc.config.parallel.sequence > 1:
-            output = split_forward_gather_backward(output, ParallelMode.SEQUENCE, dim=1)
-            # print(
-            #     f"ht debug embed: rank:{gpc.get_global_rank()} output.shape:{output.shape} output:{output}",
-            #     flush=True,
-            # )
+        # if gpc.config.parallel.sequence > 1:
+        #     output = split_forward_gather_backward(output, ParallelMode.SEQUENCE, dim=1)
+        # print(
+        #     f"ht debug embed: rank:{gpc.get_global_rank()} output.shape:{output.shape} output:{output}",
+        #     flush=True,
+        # )
 
         return output
 

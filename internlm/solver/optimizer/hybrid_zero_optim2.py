@@ -34,11 +34,25 @@ from internlm.utils.logger import get_logger
 from internlm.utils.megatron_timers import megatron_timer as timer
 from internlm.utils.timeout import llm_timeout
 
+# from internlm.model.utils import reduce_scatter_raw
+
 from .base_optimizer import BaseOptimizer
 from .utils import compute_layer_norm, compute_norm, compute_param_norm
 
 inf = math.inf
 logger = get_logger(__file__)
+
+
+def reduce_scatter_raw(input_: torch.Tensor, process_group: dist.ProcessGroup, async_op: bool = False):
+    world_size = torch.distributed.get_world_size(process_group)
+    assert input_.shape[0] % world_size == 0
+    output = torch.empty(
+        input_.shape[0] // world_size, *input_.shape[1:], dtype=input_.dtype, device=input_.device
+    ).contiguous()
+    handle = torch.distributed.reduce_scatter_tensor(
+        output, input_.contiguous(), group=process_group, async_op=async_op
+    )
+    return output, handle
 
 
 class HybridZeroOptimizer2(BaseOptimizer):
@@ -318,6 +332,20 @@ class HybridZeroOptimizer2(BaseOptimizer):
                         )
                         handle.wait()
 
+                    def reduce_scatter_wp_func():
+                        output, _ = reduce_scatter_raw(param.grad, gpc.get_group(ParallelMode.WEIGHT))
+                        gpc.embed_handler.add_param_grad(param, output)
+                        param.grad = None
+                        print(
+                            f"ht debug reduce scatter param.shape:{param.shape}, output.shape:{output.shape}",
+                            flush=True,
+                        )
+
+                        if self.skip_grad_reduce is False:
+                            param.grad = gpc.embed_handler.get_param_grad(param)
+
+                        gpc.embed_handler.split_weight_post_accum_grad()
+
                     # define hook
                     # NOT IMPORTANT BUT GOOD TO KNOW:
                     # args here is not grad, but allow_unreacable and accumulate_grad
@@ -333,6 +361,10 @@ class HybridZeroOptimizer2(BaseOptimizer):
                     def reduce_grad_hook_sp(*args):  # pylint: disable=W0613
                         if self.skip_grad_reduce is False:
                             reduction_sp_func()
+
+                    # define hook for gradients' reduce scatter in weight parallel group
+                    def reduce_scatter_grad_hook_wp(*args):  # pylint: disable=W0613
+                        reduce_scatter_wp_func()
 
                     # get the AccumulateGrad object of the param itself
                     # If these objects are not kept, reduction hooks may not be attached successfully.
@@ -354,6 +386,14 @@ class HybridZeroOptimizer2(BaseOptimizer):
                         and getattr(param, IS_SEQUENCE_PARALLEL) is True
                     ):
                         accum_grad_obj.register_hook(reduce_grad_hook_sp)
+
+                    if (
+                        gpc.config.parallel.weight.size > 1
+                        and hasattr(param, "_fstp_name")
+                        and getattr(param, "_fstp_name") == "embedding"
+                    ):
+                        print(f"register reduce scatter hook for embedding", flush=True)
+                        accum_grad_obj.register_hook(reduce_scatter_grad_hook_wp)
 
                     # we should not only register for parameters which have _fstp_reduce_scatter_str attr.
                     # we must keep up with reduce_grad_hook.
@@ -557,12 +597,17 @@ class HybridZeroOptimizer2(BaseOptimizer):
 
                 param_idx = 0
                 for param in param_group:
+                    if getattr(param, "_fstp_name", "") == "embedding":
+                        print(f"ht debug embed param:{param.grad}")
+
                     if param.grad is not None:
                         if len(avg_gradients[group_id]) == param_idx:
                             avg_gradients[group_id].append(param.grad)
                         else:
                             avg_gradients[group_id][param_idx].add_(param.grad)
                         param_idx += 1
+                    else:
+                        print(f"ht debug none param.grad:{param}")
 
         # the gradients needed are stored in the avg_gradients buffer
         # thus, can clear this
