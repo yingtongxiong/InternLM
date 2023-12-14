@@ -155,6 +155,8 @@ class ParallelContext(metaclass=SingletonMeta):
         self.virtual_pipeline_parallel_rank = None
         self._expert_parallel_group_names = []
 
+        self.last_micro_step = False
+
     @property
     def config(self):
         return self._config
@@ -624,6 +626,12 @@ class ParallelContext(metaclass=SingletonMeta):
 
     def set_virtual_pipeline_parallel_rank(self, rank):
         self.virtual_pipeline_parallel_rank = rank
+
+    def set_last_micro_step(self, is_last: bool):
+        self.last_micro_step = is_last
+
+    def is_last_micro_step(self):
+        return self.last_micro_step
 
 
 global_context = ParallelContext()

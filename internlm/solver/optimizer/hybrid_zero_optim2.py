@@ -36,7 +36,7 @@ from internlm.utils.megatron_timers import megatron_timer as timer
 from internlm.utils.timeout import llm_timeout
 
 from .base_optimizer import BaseOptimizer
-from .utils import compute_layer_norm, compute_norm, compute_param_norm
+from .utils import compute_layer_norm, compute_norm, compute_param_norm, split
 
 inf = math.inf
 logger = get_logger(__file__)
@@ -408,6 +408,7 @@ class HybridZeroOptimizer2(BaseOptimizer):
         return gpc.get_local_rank(self._broadcast_parallel_mode[group_id]) in tensor_ranks
 
     def _accum_grads_store_in_bucket(self, bucket: BucketStore, reduce_rank: Optional[int] = None) -> None:
+        is_all_reduce = gpc.is_last_micro_step() and gpc.config.parallel["weight"].get("fused_comm", False)
         for _param in bucket.get_param(reduce_rank):
             if not hasattr(_param, "_fstp_reduce_scatter_str"):
                 continue
@@ -415,14 +416,21 @@ class HybridZeroOptimizer2(BaseOptimizer):
             # wait and accumulate gardient.
             _key = getattr(_param, "_fstp_reduce_scatter_str")
             _comm_handle, _grad = self._fstp_handler.reduce_scatter_handlers[_key]
-            _comm_handle.wait()
-            _param.grad.add_(_grad)
+
+            if is_all_reduce:
+                pass
+                # _param.grad = split(_grad, ParallelMode.WEIGHT, dim=0) / gpc.get_world_size(ParallelMode.WEIGHT_DATA)
+                # if gpc.get_global_rank() == 0 and _key == "blocks.0.mixer.Wqkv.weight":
+                #     print(f"ht debug last_step _key:{_key} _param.grad:{_param.grad}")
+            else:
+                _comm_handle.wait()
+                _param.grad.add_(_grad)
 
             # release cuda memory.
-            if self._fstp_handler.enable_memory_pool:
+            if self._fstp_handler.enable_memory_pool and not is_all_reduce:
                 self._fstp_handler.release_reduce_scatter_memory(key=tuple(_grad.size()), index=_grad.index)
+                self._fstp_handler.reduce_scatter_handlers[_key] = None
             _grad = None
-            self._fstp_handler.reduce_scatter_handlers[_key] = None
 
         bucket.reset_by_rank(reduce_rank)
 
@@ -472,13 +480,7 @@ class HybridZeroOptimizer2(BaseOptimizer):
 
     def _reduce_grads_stored_in_bucket(self, current_bucket, reduce_rank=None, last_bucket=False):
         # reduce grads
-        self._reduce_grads_by_rank(
-            reduce_rank=reduce_rank,
-            grads=current_bucket.get_grad(reduce_rank=reduce_rank),
-            bucket_size=current_bucket.num_elements_in_bucket(reduce_rank),
-            group_id=current_bucket.get_param_group_id(),
-            dp_parallel_mode=current_bucket.get_dp_parallel_mode(),
-        )
+        self._reduce_grads_by_rank(reduce_rank=reduce_rank, current_bucket=current_bucket)
 
         params_in_bucket = current_bucket.get_param(reduce_rank=reduce_rank)
 
@@ -504,31 +506,62 @@ class HybridZeroOptimizer2(BaseOptimizer):
 
         current_bucket.reset_by_rank(reduce_rank)
 
-    def _reduce_grads_by_rank(self, reduce_rank, grads, bucket_size, group_id, dp_parallel_mode):
-        grad_buckets_by_dtype = split_half_float_double(grads)
-        next_bucket_list = []
-        # add parameters into bucket for reduction
-        for tensor_list in grad_buckets_by_dtype:
-            param_bucket = TensorBucket(size=bucket_size)
-            for tensor in tensor_list:
-                param_bucket.add_to_bucket(tensor, allow_oversize=True)
-            if not param_bucket.is_empty():
-                self._reduce_and_copy(
-                    bucket=param_bucket, reduce_rank=reduce_rank, group_id=group_id, dp_parallel_mode=dp_parallel_mode
-                )
-            next_bucket_list.append(param_bucket)
+    def _reduce_grads_by_rank(self, reduce_rank, current_bucket):
+        group_id = current_bucket.get_param_group_id()
+        dp_parallel_mode = current_bucket.get_dp_parallel_mode()
+
+        def _reduce_helper(grads, bucket_size, reduce_mode, is_linear=False):
+            grad_buckets_by_dtype = split_half_float_double(grads)
+            next_bucket_list = []
+            # add parameters into bucket for reduction
+            for tensor_list in grad_buckets_by_dtype:
+                param_bucket = TensorBucket(size=bucket_size, is_linear=is_linear)
+                for tensor in tensor_list:
+                    param_bucket.add_to_bucket(tensor, allow_oversize=True)
+                if not param_bucket.is_empty():
+                    self._reduce_and_copy(
+                        bucket=param_bucket,
+                        reduce_rank=reduce_rank,
+                        group_id=group_id,
+                        dp_parallel_mode=reduce_mode,
+                    )
+                next_bucket_list.append(param_bucket)
+
+            return next_bucket_list
+
+        if gpc.config.parallel["weight"].get("fused_comm", False):
+            grads = current_bucket.get_grad(filter="linear")
+            bucket_size = current_bucket.num_linear_elements_in_bucket()
+            linear_grads_buckets = _reduce_helper(grads, bucket_size, ParallelMode.GLOBAL, is_linear=True)
+
+            grads = current_bucket.get_grad(filter="nonlinear")
+            bucket_size = current_bucket.num_nonlinear_elements_in_bucket()
+            nonlinear_grads_buckets = _reduce_helper(grads, bucket_size, dp_parallel_mode)
+
+            grads_buckets = linear_grads_buckets + nonlinear_grads_buckets
+        else:
+            grads = current_bucket.get_grad(filter="full")
+            bucket_size = current_bucket.num_elements_in_bucket()
+            grads_buckets = _reduce_helper(grads, bucket_size, dp_parallel_mode)
 
         # wait for the completion of previouce bucket list reduction, and do unflatten_and_copy()
         # here we can also overlap the communication with some memcpy operation caused by bucket.flatten()
         for bucket in self._bucket_in_progress:
             bucket.commu_handle.wait()
             bucket.unflatten_and_copy()
+
+            if bucket.is_linear is True:
+                for grad in bucket.get_bucket():
+                    param = getattr(grad, "param")
+                    grad = split(grad, ParallelMode.WEIGHT, dim=0) / gpc.get_world_size(ParallelMode.WEIGHT_DATA)
+                    param.grad = grad
+
             bucket.empty()
         self._bucket_in_progress = []
         self._param_store.clear_grads_of_previous_reduced_params()
 
         # after the completion of bucket list reduction, add new buckets into _bucket_in_progress
-        self._bucket_in_progress = next_bucket_list.copy()
+        self._bucket_in_progress = grads_buckets
 
     def _reduce_and_copy(self, bucket: TensorBucket, reduce_rank, group_id, dp_parallel_mode):
         # flatten the tensors and do allreduce
@@ -537,6 +570,7 @@ class HybridZeroOptimizer2(BaseOptimizer):
             tensor=bucket.get_flat_tensor(),
             dtype=None,
             dst_rank=reduce_rank,
+            op=torch.distributed.ReduceOp.SUM if bucket.is_linear else torch.distributed.ReduceOp.AVG,
             parallel_mode=dp_parallel_mode,
         )
 
@@ -584,6 +618,11 @@ class HybridZeroOptimizer2(BaseOptimizer):
                         else:
                             avg_gradients[group_id][param_idx].add_(param.grad)
                         param_idx += 1
+
+                        if hasattr(param, "_fstp_reduce_scatter_str"):
+                            _key = getattr(param, "_fstp_reduce_scatter_str")
+                            if gpc.get_global_rank() == 0 and _key == "blocks.0.mixer.Wqkv.weight":
+                                print(f"ht debug baseline last_step _key:{_key} _param.grad:{param.grad}")
 
         # the gradients needed are stored in the avg_gradients buffer
         # thus, can clear this

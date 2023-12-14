@@ -85,9 +85,11 @@ def switch_optimizer_grad_sync_skip_mode(optimizer, skip: bool = True):
     prev_mode = optimizer.skip_grad_reduce
     try:
         optimizer.skip_grad_reduce = skip
+        gpc.set_last_micro_step(not skip)
         yield
     finally:
         optimizer.skip_grad_reduce = prev_mode
+        gpc.set_last_micro_step(not prev_mode)
 
 
 class PipelineScheduler(BaseScheduler):

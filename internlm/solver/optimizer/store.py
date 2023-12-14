@@ -8,6 +8,8 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.core.context.parallel_context import IS_WEIGHT_ZERO_PARALLEL
+from internlm.utils.parallel import is_weight_zero_parallel_parameter
 
 
 class BaseStore:
@@ -40,11 +42,19 @@ class BucketStore(BaseStore):
         self._num_elements_in_bucket = dict()
         self._dp_parallel_mode = dp_parallel_mode
         self._group_id = group_id
+        self._num_linear_elements = dict()
+        self._num_nonlinear_elements = dict()
 
         self.reset()
 
     def num_elements_in_bucket(self, reduce_rank: int = None):
         return self._num_elements_in_bucket[reduce_rank]
+
+    def num_linear_elements_in_bucket(self, reduce_rank: int = None):
+        return self._num_linear_elements[reduce_rank]
+
+    def num_nonlinear_elements_in_bucket(self, reduce_rank: int = None):
+        return self._num_nonlinear_elements[reduce_rank]
 
     def num_params_in_bucket(self, reduce_rank: int = None):
         return len(self._params[reduce_rank])
@@ -63,20 +73,44 @@ class BucketStore(BaseStore):
 
     def add_param(self, tensor, reduce_rank: int = None):
         self._params[reduce_rank].append(tensor)
+        if is_weight_zero_parallel_parameter(tensor):
+            self._num_linear_elements[reduce_rank] += tensor.numel()
+        else:
+            self._num_nonlinear_elements[reduce_rank] += tensor.numel()
 
     def reset(self):
         keys = [None] + list(range(self._world_size))
         self._grads = {rank: [] for rank in keys}
         self._params = {rank: [] for rank in keys}
         self._num_elements_in_bucket = {rank: 0 for rank in keys}
+        self._num_linear_elements = {rank: 0 for rank in keys}
+        self._num_nonlinear_elements = {rank: 0 for rank in keys}
 
     def reset_by_rank(self, reduce_rank=None):
         self._grads[reduce_rank] = []
         self._params[reduce_rank] = []
         self._num_elements_in_bucket[reduce_rank] = 0
+        self._num_linear_elements[reduce_rank] = 0
+        self._num_nonlinear_elements[reduce_rank] = 0
 
-    def get_grad(self, reduce_rank: int = None):
-        return self._grads[reduce_rank]
+    def get_grad(self, reduce_rank: int = None, filter: str = "full"):
+        if filter == "full":
+            return self._grads[reduce_rank]
+        elif filter == "linear":
+            filtered_grads = []
+            for idx, param in enumerate(self._params[reduce_rank]):
+                if is_weight_zero_parallel_parameter(param):
+                    assert hasattr(param, "_fstp_reduce_scatter_str")
+                    filtered_grads.append(gpc.fstp_handler.reduce_scatter_handlers[param._fstp_reduce_scatter_str][1])
+                    setattr(gpc.fstp_handler.reduce_scatter_handlers[param._fstp_reduce_scatter_str][1], "param", param)
+                    gpc.fstp_handler.reduce_scatter_handlers[param._fstp_reduce_scatter_str] = None
+            return filtered_grads
+        elif filter == "nonlinear":
+            filtered_grads = []
+            for idx, param in enumerate(self._params[reduce_rank]):
+                if not is_weight_zero_parallel_parameter(param):
+                    filtered_grads.append(self._grads[reduce_rank][idx])
+            return filtered_grads
 
     def get_param(self, reduce_rank: int = None):
         return self._params[reduce_rank]
@@ -278,13 +312,14 @@ class TensorBucket:
     Tensor Bucket
     """
 
-    def __init__(self, size):
+    def __init__(self, size, is_linear):
         self._max_size = size
         self._current_size = 0
         self._bucket = []
         self._flat_tensor = None
         self._unflatten_and_copy_flag = False
         self.commu_handle = None
+        self.is_linear = is_linear
 
     @property
     def max_size(self):

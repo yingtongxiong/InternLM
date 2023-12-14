@@ -72,6 +72,26 @@ def get_grad_accumulate_object(tensor):
     return grad_acc_obj
 
 
+def split(input_, parallel_mode, dim=-1):
+    # skip if only one rank involved
+    world_size = gpc.get_world_size(parallel_mode)
+    if world_size == 1:
+        return input_
+
+    # Split along last dimension.
+    dim_size = input_.size(dim)
+    assert dim_size % world_size == 0, (
+        f"The dimension to split ({dim_size}) is not a multiple of world size ({world_size}), "
+        f"cannot split tensor evenly"
+    )
+
+    tensor_list = torch.split(input_, dim_size // world_size, dim=dim)
+    rank = gpc.get_local_rank(parallel_mode)
+    output = tensor_list[rank].contiguous()
+
+    return output
+
+
 def split_half_float_double(tensor_list):
     dtype_buckets = {
         "torch.cuda.HalfTensor": [],
@@ -89,7 +109,9 @@ def split_half_float_double(tensor_list):
     return buckets
 
 
-def reduce_tensor(tensor, dtype=None, dst_rank=None, parallel_mode=ParallelMode.DATA):
+def reduce_tensor(
+    tensor, dtype=None, dst_rank=None, op=torch.distributed.ReduceOp.AVG, parallel_mode=ParallelMode.DATA
+):
     """
     Reduce the tensor in the data parallel process group
 
@@ -124,12 +146,12 @@ def reduce_tensor(tensor, dtype=None, dst_rank=None, parallel_mode=ParallelMode.
     use_all_reduce = dst_rank is None
 
     if use_all_reduce:
-        handle = dist.all_reduce(tensor=tensor, group=group, op=torch.distributed.ReduceOp.AVG, async_op=True)
+        handle = dist.all_reduce(tensor=tensor, group=group, op=op, async_op=True)
     else:
         ranks_in_group = gpc.get_ranks_in_group(parallel_mode)
         global_rank = ranks_in_group[dst_rank]
         handle = dist.reduce(
-            tensor=tensor, dst=global_rank, group=group, op=torch.distributed.ReduceOp.AVG, async_op=True
+            tensor=tensor, dst=global_rank, group=group, op=op, async_op=True
         )
 
     return handle

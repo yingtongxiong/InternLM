@@ -162,19 +162,23 @@ def linear_bias_wgrad_torch(my_input, grad_output, has_d_bias):
     return grad_weight, grad_bias
 
 
-def reduce_scatter_raw(input_: Tensor, process_group: ProcessGroup, async_op: bool = False):
+def reduce_scatter_raw(
+    input_: Tensor, process_group: ProcessGroup, op=torch.distributed.ReduceOp.SUM, async_op: bool = False
+):
     world_size = torch.distributed.get_world_size(process_group)
     assert input_.shape[0] % world_size == 0
     output = torch.empty(
         input_.shape[0] // world_size, *input_.shape[1:], dtype=input_.dtype, device=input_.device
     ).contiguous()
     handle = torch.distributed.reduce_scatter_tensor(
-        output, input_.contiguous(), group=process_group, async_op=async_op
+        output, input_.contiguous(), op=op, group=process_group, async_op=async_op
     )
     return output, handle
 
 
-def reduce_scatter_raw_memory_pool(input_: Tensor, process_group: ProcessGroup, async_op: bool = False):
+def reduce_scatter_raw_memory_pool(
+    input_: Tensor, process_group: ProcessGroup, op=torch.distributed.ReduceOp.SUM, async_op: bool = False
+):
     world_size = torch.distributed.get_world_size(process_group)
     assert input_.shape[0] % world_size == 0
     if gpc.fstp_handler.enable_memory_pool:
@@ -185,7 +189,7 @@ def reduce_scatter_raw_memory_pool(input_: Tensor, process_group: ProcessGroup, 
             input_.shape[0] // world_size, *input_.shape[1:], dtype=input_.dtype, device=input_.device
         ).contiguous()
     handle = torch.distributed.reduce_scatter_tensor(
-        output, input_.contiguous(), group=process_group, async_op=async_op
+        output, input_.contiguous(), op=op, group=process_group, async_op=async_op
     )
     return output, handle
 
@@ -572,45 +576,117 @@ class FSTPFusedDenseFunc(torch.autograd.Function):
             grad_weight, grad_bias = fused_dense_cuda.linear_bias_wgrad(
                 total_x.reshape(batch_dim, total_x.shape[-1]), grad_output, ctx.needs_input_grad[2]
             )
+            # if weight._fstp_reduce_scatter_str == "blocks.0.mixer.Wqkv.weight":
+            # print(
+            #     f"ht debug rank:{gpc.get_global_rank()} prev_accum_grad.shape:{prev_accum_grad.shape} prev_accum_grad:{prev_accum_grad}"
+            # )
+            # print(
+            #     f"ht debug rank:{gpc.get_global_rank()} grad_weight.shape:{grad_weight.shape} grad_weight_async:{grad_weight}",
+            #     flush=True,
+            # )
+
             if world_size > 1:
                 if overlap_handler is not None:
-                    grad_weight_async, handle_grad_weight = reduce_scatter_raw_memory_pool(
-                        grad_weight, process_group, async_op=True
-                    )
-                    assert hasattr(weight, "_fstp_reduce_scatter_str")
-                    overlap_handler.reduce_scatter_handlers[weight._fstp_reduce_scatter_str] = (
-                        handle_grad_weight,
-                        grad_weight_async,
-                    )
-                    grad_weight = overlap_handler.get_zero_by_shape(
-                        (
-                            grad_weight.shape[0] // torch.distributed.get_world_size(process_group),
-                            *grad_weight.shape[1:],
-                        ),
-                        dtype=grad_weight.dtype,
-                        device=grad_weight.device,
-                    )
-                    if grad_bias is not None:
-                        grad_bias_async, handle_grad_bias = reduce_scatter_raw_memory_pool(
-                            grad_bias, process_group, async_op=True
+                    if gpc.is_last_micro_step() and gpc.config.parallel["weight"].get("fused_comm", False):
+                        prev_accum_grad = weight.grad
+                        weight.grad = None
+                        grad_weight_async = grad_weight
+                        grad_weight_async /= gpc.get_world_size(ParallelMode.WEIGHT)
+
+                        step_per_rank = prev_accum_grad.shape[0]
+                        start_idx = gpc.get_local_rank(ParallelMode.WEIGHT) * step_per_rank
+                        end_idx = start_idx + step_per_rank
+                        grad_weight_async[start_idx:end_idx, :] += prev_accum_grad
+
+                        # handle_grad_weight = torch.distributed.all_reduce(
+                        #     tensor=grad_weight_async,
+                        #     group=gpc.get_group(ParallelMode.GLOBAL),
+                        #     op=torch.distributed.ReduceOp.SUM,
+                        #     async_op=True,
+                        # )
+
+                        assert hasattr(weight, "_fstp_reduce_scatter_str")
+                        overlap_handler.reduce_scatter_handlers[weight._fstp_reduce_scatter_str] = (
+                            None,
+                            grad_weight_async,
                         )
-                        assert hasattr(bias, "_fstp_reduce_scatter_str")
-                        overlap_handler.reduce_scatter_handlers[bias._fstp_reduce_scatter_str] = (
-                            handle_grad_bias,
-                            grad_bias_async,
-                        )
-                        grad_bias = overlap_handler.get_zero_by_shape(
+
+                        grad_weight = overlap_handler.get_zero_by_shape(
                             (
-                                grad_bias.shape[0] // torch.distributed.get_world_size(process_group),
-                                *grad_bias.shape[1:],
+                                grad_weight.shape[0] // torch.distributed.get_world_size(process_group),
+                                *grad_weight.shape[1:],
                             ),
-                            dtype=grad_bias.dtype,
-                            device=grad_bias.device,
+                            dtype=grad_weight.dtype,
+                            device=grad_weight.device,
                         )
+
+                        assert grad_bias is None
+                    else:
+                        grad_weight_async, handle_grad_weight = reduce_scatter_raw_memory_pool(
+                            grad_weight, process_group, op=torch.distributed.ReduceOp.AVG, async_op=True
+                        )
+                        assert hasattr(weight, "_fstp_reduce_scatter_str")
+                        overlap_handler.reduce_scatter_handlers[weight._fstp_reduce_scatter_str] = (
+                            handle_grad_weight,
+                            grad_weight_async,
+                        )
+                        grad_weight = overlap_handler.get_zero_by_shape(
+                            (
+                                grad_weight.shape[0] // torch.distributed.get_world_size(process_group),
+                                *grad_weight.shape[1:],
+                            ),
+                            dtype=grad_weight.dtype,
+                            device=grad_weight.device,
+                        )
+                        if grad_bias is not None:
+                            grad_bias_async, handle_grad_bias = reduce_scatter_raw_memory_pool(
+                                grad_bias, process_group, op=torch.distributed.ReduceOp.AVG, async_op=True
+                            )
+                            assert hasattr(bias, "_fstp_reduce_scatter_str")
+                            overlap_handler.reduce_scatter_handlers[bias._fstp_reduce_scatter_str] = (
+                                handle_grad_bias,
+                                grad_bias_async,
+                            )
+                            grad_bias = overlap_handler.get_zero_by_shape(
+                                (
+                                    grad_bias.shape[0] // torch.distributed.get_world_size(process_group),
+                                    *grad_bias.shape[1:],
+                                ),
+                                dtype=grad_bias.dtype,
+                                device=grad_bias.device,
+                            )
                 else:
-                    grad_weight, handle_grad_weight = reduce_scatter_raw(grad_weight, process_group, async_op=True)
-                    if grad_bias is not None:
-                        grad_bias, handle_grad_bias = reduce_scatter_raw(grad_bias, process_group, async_op=True)
+                    if gpc.is_last_micro_step() and gpc.config.parallel["weight"].get("fused_comm", False):
+                        prev_accum_grad = weight.grad
+                        weight.grad = None
+
+                        step_per_rank = prev_accum_grad.shape[0]
+                        start_idx = gpc.get_local_rank(ParallelMode.WEIGHT) * step_per_rank
+                        end_idx = start_idx + step_per_rank
+                        grad_weight[start_idx:end_idx, :] += prev_accum_grad
+
+                        handle_grad_weight = torch.distributed.all_reduce(
+                            tensor=grad_weight,
+                            group=gpc.get_group(ParallelMode.GLOBAL),
+                            op=torch.distributed.ReduceOp.AVG,
+                            async_op=True,
+                        )
+
+                        assert hasattr(weight, "_fstp_reduce_scatter_str")
+                        overlap_handler.reduce_scatter_handlers[weight._fstp_reduce_scatter_str] = (
+                            handle_grad_weight,
+                            grad_weight,
+                        )
+
+                        assert grad_bias is None
+                    else:
+                        grad_weight, handle_grad_weight = reduce_scatter_raw(
+                            grad_weight, process_group, op=torch.distributed.ReduceOp.AVG, async_op=True
+                        )
+                        if grad_bias is not None:
+                            grad_bias, handle_grad_bias = reduce_scatter_raw(
+                                grad_bias, process_group, op=torch.distributed.ReduceOp.AVG, async_op=True
+                            )
         else:
             grad_weight = None
             grad_bias = grad_output if ctx.needs_input_grad[2] else None
@@ -628,6 +704,9 @@ class FSTPFusedDenseFunc(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             if world_size > 1 and overlap_handler is None:
                 handle_grad_weight.wait()
+                if gpc.is_last_micro_step() and gpc.config.parallel["weight"].get("fused_comm", False):
+                    grad_weight = _split(grad_weight, ParallelMode.WEIGHT, dim=0)
+                    grad_weight /= gpc.get_world_size(ParallelMode.WEIGHT_DATA)
                 if grad_bias is not None:
                     handle_grad_bias.wait()
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None

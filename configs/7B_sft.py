@@ -44,7 +44,7 @@ ckpt = dict(
     oss_snapshot_freq=int(CHECKPOINT_EVERY / 2),  # snapshot ckpt save frequency.
 )
 
-TRAIN_FOLDER = "/path/to/dataset"
+TRAIN_FOLDER = "/mnt/petrelfs/share_data/llm_data/0715_llama_tokenized_refined_real/train"
 VALID_FOLDER = "/path/to/dataset"
 data = dict(
     seq_len=SEQ_LEN,
@@ -55,9 +55,9 @@ data = dict(
     # defaults to the value of micro_num
     valid_micro_num=4,
     # defaults to 0, means disable evaluate
-    valid_every=50,
+    valid_every=50000,
     pack_sample_into_one=True,
-    total_steps=10,
+    total_steps=20,
     skip_batches="",
     rampup_batch_size="",
     # Datasets with less than 50 rows will be discarded
@@ -162,10 +162,10 @@ pipeline parallel (dict):
         defaults to False.
 """
 parallel = dict(
-    zero1=dict(size=2, fsdp=False),
+    zero1=dict(size=4, fsdp=False),
     tensor=dict(size=1, sp="intern", intern_overlap=False, memory_pool=False),
     pipeline=dict(size=1, interleaved_overlap=True),
-    weight=dict(size=8, overlap=True, memory_pool=True),
+    weight=dict(size=4, overlap=True, memory_pool=True, fused_comm=True),
     sequence=4,
 )
 
