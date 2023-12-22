@@ -11,6 +11,7 @@ import torch
 
 from internlm.core.context import Config
 from internlm.core.context import global_context as gpc
+from internlm.core.context.process_group_initializer import ParallelMode
 from internlm.monitor import initialize_light_monitor
 from internlm.utils.common import get_master_node
 from internlm.utils.logger import get_logger
@@ -318,7 +319,11 @@ def args_sanity_check():
         "intern",
     ], "invalid sp mode, only ['none', 'megatron', 'flash-attn', 'intern'] is supported"
     # adapt to old version's sequence parallel config
-    if gpc.config.parallel["tensor"].get("sp", None) in ["megatron", "flash-attn", "intern"]:
+    if (
+        gpc.config.parallel["tensor"].get("sp", None) in ["megatron", "flash-attn", "intern"]
+        and gpc.is_initialized(ParallelMode.TENSOR)
+        and gpc.get_world_size(ParallelMode.TENSOR) > 1
+    ):
         gpc.config.parallel.sequence_parallel = True
 
     # currently only interleaved pipeline scheduler with overlap can guarantee loss accuracy

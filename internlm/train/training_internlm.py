@@ -608,6 +608,8 @@ def record_current_batch_training_metrics(
             tflops_list_2.append(tflops_2)
         if batch_count == gpc.config.data.total_steps - 1:
             print(tgs_list, flush=True)
+            if len(tgs_list) <= 0:
+                return
             avg_tgs = sum(tgs_list) / len(tgs_list)
             for tgs in tgs_list.copy():
                 if abs(tgs - avg_tgs) > 400:
