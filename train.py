@@ -178,12 +178,13 @@ def main(args):
     )
 
     # initialize metric for calculating accuracy and perplexity
-    metric = AccPerplex(
-        device=torch.cuda.current_device(),
-        tp_pg=gpc.get_group(ParallelMode.TENSOR),
-        dp_pg=gpc.get_group(ParallelMode.DATA),
-        dataset_types=dataset_types,
-    )
+    # metric = AccPerplex(
+    #     device=torch.cuda.current_device(),
+    #     tp_pg=gpc.get_group(ParallelMode.TENSOR),
+    #     dp_pg=gpc.get_group(ParallelMode.DATA),
+    #     dataset_types=dataset_types,
+    # )
+    metric = None
 
     # initialize trainer
 
@@ -204,6 +205,7 @@ def main(args):
             optimizer.optim,
             log_folder=f"memory_trace/rank{gpc.get_global_rank()}_"
             + f"dp{gpc.get_local_rank(ParallelMode.DATA)}_"
+            + f"wp{gpc.get_local_rank(ParallelMode.WEIGHT)}_"
             + f"tp{gpc.get_local_rank(ParallelMode.TENSOR)}",
         )
     else:
@@ -241,7 +243,9 @@ def main(args):
             trainer.zero_grad()
             # process data
             if batch[0].get("type_ids", None) is not None:
-                metric.set_current_type_ids(type_ids=batch[0].pop("type_ids", None))
+                _type_ids = batch[0].pop("type_ids", None)
+                if metric is not None:
+                    metric.set_current_type_ids(type_ids=_type_ids)
 
             # do forward and backward
             timer("fwd-bwd").start()

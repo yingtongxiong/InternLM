@@ -525,7 +525,7 @@ def record_current_batch_training_metrics(
     timer.store_last_timers()
     if success_update in (0, True):
         train_state.num_consumed_tokens += batch[1].nelement() * gpc.get_world_size(ParallelMode.DATA)
-    if gpc.is_no_pp_or_last_stage():
+    if gpc.is_no_pp_or_last_stage() and metric is not None:
         acc_perplex = metric.get_metric()
 
     if success_update and gpc.is_rank_for_log():
@@ -625,8 +625,9 @@ def record_current_batch_training_metrics(
         fwd_bwd_time = round(timer("fwd-bwd").elapsed(), 2)
         infos["fwd_bwd_time"] = fwd_bwd_time
 
-        for key, value in acc_perplex.items():
-            infos[key] = value
+        if metric is not None:
+            for key, value in acc_perplex.items():
+                infos[key] = value
 
         if gpc.config.get("grad_norm_profiling", False):
             layer_norms = copy.deepcopy(grad_norm["layer_norms"])
@@ -663,8 +664,8 @@ def record_current_batch_training_metrics(
                 "loss": loss.item() - moe_loss.item() if moe_loss is not None else loss.item(),
                 "flops": tflops,
                 "tgs": last_tgs_1,
-                "acc": acc_perplex["acc"],
-                "perplexity": acc_perplex["perplexity"],
+                # "acc": acc_perplex["acc"],
+                # "perplexity": acc_perplex["perplexity"],
                 "fwd_bwd_time": fwd_bwd_time,
             }
             if moe_loss is not None:
