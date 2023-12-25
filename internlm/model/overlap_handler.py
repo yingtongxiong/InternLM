@@ -45,6 +45,7 @@ class FSTPOverlapHandler:
 
         self.reduce_scatter_handlers = {}
         self.zero_const_pool = {}
+        self._lazy_memory_traced = False
 
         # just want to share same for loop for ModuleList and Module
         if not isinstance(model, nn.ModuleList):
@@ -90,7 +91,10 @@ class FSTPOverlapHandler:
     def get_zero_by_shape(self, size: tuple, dtype, device) -> torch.Tensor:
         if self.enable_memory_pool:
             if size not in self.zero_const_pool:
-                self.zero_const_pool[size] = torch.zeros(*size, dtype=dtype, device=device).contiguous()
+                if self._lazy_memory_traced:
+                    assert False, f"no zero const for this shape {size}"
+                else:
+                    self.zero_const_pool[size] = torch.zeros(*size, dtype=dtype, device=device).contiguous()
 
             return self.zero_const_pool[size]
         else:
@@ -131,8 +135,35 @@ class FSTPOverlapHandler:
     def clear_memory_pool(self) -> None:
         assert self.enable_memory_pool
 
+        if self._lazy_memory_traced:
+            return
+
+        _dtype = gpc.config.model.get("dtype", torch.half)
+        _device = get_current_device()
+        zero_keys = [self.zero_const_pool.keys()]
+        reduce_scatter_lengths = {key: len(val) for key, val in self.reduce_scatter_memory_pool.items()}
+
+        # first, clean up scattered video memory.
         self.zero_const_pool = {}
         self.reduce_scatter_memory_pool = {}
+        self._lazy_memory_traced = True
+
+        def _allocate_memory_item(_key, idx):
+            item = torch.zeros(_key, dtype=_dtype, device=_device).contiguous()
+            setattr(item, "idle", True)
+            setattr(item, "index", idx)
+
+            return item
+
+        # allocate more organized video memory.
+        self.zero_const_pool = {
+            size: torch.zeros(*size, dtype=_dtype, device=_device).contiguous() for size in zero_keys
+        }
+
+        self.reduce_scatter_memory_pool = {
+            key: [_allocate_memory_item(key, i) for i in range(length)]
+            for key, length in reduce_scatter_lengths.items()
+        }
 
     def _get_weight_from_memory_pool(self, module):
         assert self.enable_memory_pool
@@ -189,13 +220,16 @@ class FSTPOverlapHandler:
                 return self.reduce_scatter_memory_pool[key][index]
 
         # if the memory pool is all used
-        cur_len = len(self.reduce_scatter_memory_pool[key])
-        self.reduce_scatter_memory_pool[key].append(
-            torch.zeros(key, dtype=gpc.config.model.get("dtype", torch.half), device=get_current_device()).contiguous()
-        )
-        setattr(self.reduce_scatter_memory_pool[key][cur_len], "idle", False)
-        setattr(self.reduce_scatter_memory_pool[key][cur_len], "index", cur_len)
-        return self.reduce_scatter_memory_pool[key][cur_len]
+        if self._lazy_memory_traced:
+            assert False, f"No enough memory for reduce_scatter {key}."
+        else:
+            item = torch.zeros(
+                key, dtype=gpc.config.model.get("dtype", torch.half), device=get_current_device()
+            ).contiguous()
+            setattr(item, "idle", False)
+            setattr(item, "index", len(self.reduce_scatter_memory_pool[key]))
+            self.reduce_scatter_memory_pool[key].append(item)
+            return item
 
     def release_reduce_scatter_memory(self, key, index):
         assert self.enable_memory_pool
