@@ -8,7 +8,7 @@ import torch
 from flash_attn.modules.embedding import ParallelGPT2Embeddings
 from flash_attn.modules.mlp import ParallelFusedMLP
 from torch import nn
-from torch._utils import _unflatten_dense_tensors
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
@@ -407,18 +407,6 @@ class PackedFlashInternLm1D(nn.Module):
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() if cu_seqlens is not None else None
 
         def _sync_param(flat_tensor, tensor_list):
-            """
-            Synchronize the flattened tensor and unflattened tensor list. When
-            a list of tensor are flattened with `torch._utils._unflatten_dense_tensors`,
-            a new tensor is created. Thus, the flat tensor and original tensor list do not
-            share the same memory space. This function will update the tensor list so that
-            they point to the same value.
-
-            :param flat_tensor: A flat tensor obtained by calling `torch._utils._unflatten_dense_tensors` on a tensor lsit
-            :param tensor_list: A list of tensors corresponding to the flattened tensor
-            :type flat_tensor: torch.Tensor
-            :type tensor_list: List[torch.Tensor]
-            """
             updated_params = _unflatten_dense_tensors(flat_tensor, tensor_list)
 
             # update the tensor data
@@ -439,15 +427,12 @@ class PackedFlashInternLm1D(nn.Module):
 
             origin_hidden_states.append(hidden_states)
 
-            if idx % 4 == 0:
+            if (idx + 1) % 4 == 0:
                 assert len(origin_hidden_states) == 4, "????"
 
-                buffer_size_4 = torch.zeros(
-                    *(4 * hidden_states.shape[0], *hidden_states.shape[1:]),
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-
+                with torch.no_grad():
+                    buffer_size_4 = _flatten_dense_tensors(origin_hidden_states)
+                    buffer_size_4 = buffer_size_4.cuda()
                 _sync_param(buffer_size_4, origin_hidden_states)
                 origin_hidden_states = []
 
