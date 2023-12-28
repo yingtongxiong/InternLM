@@ -197,7 +197,9 @@ class MHA(nn.Module):
                     scaling_factor=1.0,  # Currently do not support dynamic scaling.
                 )
             else:
-                self.rotary_emb = RotaryEmbedding(self.rotary_emb_dim, scale_base=rotary_emb_scale_base, device=device)
+                self.rotary_emb = RotaryEmbedding(
+                    self.rotary_emb_dim, scale_base=rotary_emb_scale_base, device=device, block_idx=layer_idx
+                )
 
         # notice here should change bias=True
         Wqkv_cls = get_linear_cls(tp_mode, "column")

@@ -157,3 +157,5 @@ loss_tensorboard/*
 
 atb
 pip
+
+*.pickle

@@ -118,6 +118,8 @@ apply_rotary_emb_qkv_ = ApplyRotaryEmbQKV_.apply
 legacy_apply_rotary_embed_qkv = LegacyApplyRotaryEmbQKV_.apply
 legacy_apply_rotary_embed = LegacyApplyRotaryEmb.apply
 
+cache_sin_cos = None
+
 
 class RotaryEmbedding(torch.nn.Module):
     """
@@ -137,7 +139,7 @@ class RotaryEmbedding(torch.nn.Module):
     Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
     """
 
-    def __init__(self, dim: int, base=10000, scale_base=0, device=None):
+    def __init__(self, dim: int, base=10000, scale_base=0, device=None, block_idx=0):
         """ """
         super().__init__()
         # Generate and save the inverse frequency buffer (non trainable)
@@ -156,8 +158,18 @@ class RotaryEmbedding(torch.nn.Module):
         self._sin_cached = None
         self._cos_k_cached = None
         self._sin_k_cached = None
+        self.block_idx = block_idx
 
     def _update_cos_sin_cache(self, x, indexes):
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+        def _sync_param(flat_tensor, tensor_list):
+            updated_params = _unflatten_dense_tensors(flat_tensor, tensor_list)
+
+            # update the tensor data
+            for p, q in zip(tensor_list, updated_params):
+                p.data = q.data
+
         """x: (batch, seqlen, nheads, headdim) or (batch, seqlen, 3, nheads, headdim)"""
         if not isinstance(indexes, int):
             seqlen = indexes.max().item() + 1
@@ -171,7 +183,20 @@ class RotaryEmbedding(torch.nn.Module):
             # Don't do einsum, it converts fp32 to fp16
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             freqs = torch.outer(t, self.inv_freq.to(device=t.device))
+            # global cache_sin_cos
+            # if cache_sin_cos is None:
+            #     with torch.no_grad():
+            #         cache_sin_cos = [
+            #             torch.zeros_like(torch.cos(freqs).to(x.dtype), dtype=x.dtype)
+            #             for _ in range(gpc.config.NUM_LAYER * 2)
+            #         ]
+            #         flat_buffer = _flatten_dense_tensors(cache_sin_cos)
+            #         _sync_param(flat_buffer, cache_sin_cos)
+            # self._cos_cached = cache_sin_cos[self.block_idx * 2]
+            # self._sin_cached = cache_sin_cos[self.block_idx * 2 + 1]
             if self.scale is None:
+                # self._sin_cached.copy_(torch.sin(freqs).to(x.dtype))
+                # self._cos_cached.copy_(torch.cos(freqs).to(x.dtype))
                 self._cos_cached = torch.cos(freqs).to(x.dtype)
                 self._sin_cached = torch.sin(freqs).to(x.dtype)
             else:

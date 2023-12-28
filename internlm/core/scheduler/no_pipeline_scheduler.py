@@ -128,6 +128,8 @@ class NonPipelineScheduler(BaseScheduler):
                 loss /= scale_loss
                 loss += moe_loss
 
+            output = None
+
         # backward
         if not forward_only:
             self._call_hooks("before_backward", None, None)

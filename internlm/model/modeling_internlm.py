@@ -8,7 +8,6 @@ import torch
 from flash_attn.modules.embedding import ParallelGPT2Embeddings
 from flash_attn.modules.mlp import ParallelFusedMLP
 from torch import nn
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
@@ -406,15 +405,17 @@ class PackedFlashInternLm1D(nn.Module):
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() if cu_seqlens is not None else None
 
-        def _sync_param(flat_tensor, tensor_list):
-            updated_params = _unflatten_dense_tensors(flat_tensor, tensor_list)
+        # from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-            # update the tensor data
-            for p, q in zip(tensor_list, updated_params):
-                p.data = q.data
+        # def _sync_param(flat_tensor, tensor_list):
+        #     updated_params = _unflatten_dense_tensors(flat_tensor, tensor_list)
 
-        buffer_size_4: torch.Tensor = None
-        origin_hidden_states = []
+        #     # update the tensor data
+        #     for p, q in zip(tensor_list, updated_params):
+        #         p.data = q.data
+
+        # buffer_size_4: torch.Tensor = None
+        # origin_hidden_states = []
 
         for idx, block in enumerate(self.blocks):
             hidden_states = block(
@@ -425,16 +426,17 @@ class PackedFlashInternLm1D(nn.Module):
                 max_seqlen=max_seqlen,
             )
 
-            origin_hidden_states.append(hidden_states)
+            # origin_hidden_states.append(hidden_states)
 
-            if (idx + 1) % 4 == 0:
-                assert len(origin_hidden_states) == 4, "????"
+            # if (idx + 1) % 3 == 0:
+            #     assert len(origin_hidden_states) == 3, "????"
 
-                with torch.no_grad():
-                    buffer_size_4 = _flatten_dense_tensors(origin_hidden_states)
-                    buffer_size_4 = buffer_size_4.cuda()
-                _sync_param(buffer_size_4, origin_hidden_states)
-                origin_hidden_states = []
+            #     with torch.no_grad():
+            #         buffer_size_4 = _flatten_dense_tensors(origin_hidden_states)
+            #         buffer_size_4 = buffer_size_4.cuda()
+            #         _sync_param(buffer_size_4, origin_hidden_states)
+
+            #     origin_hidden_states = []
 
         if hasattr(self, "norm"):
             hidden_states = self.norm(hidden_states.float())

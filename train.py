@@ -1,5 +1,28 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
+def assert_current_device_empty():
+    """Assert the current device is empty."""
+    from pynvml.smi import nvidia_smi
+    import os
+
+    nvsmi = nvidia_smi.getInstance()
+    result = nvsmi.DeviceQuery("memory.used")["gpu"]
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        devices = list(map(int, os.environ["CUDA_VISIBLE_DEVICES"].split(",")))
+        if "SLURM_LOCALID" in os.environ:
+            device_id = devices[int(os.environ["SLURM_LOCALID"])]
+            cur_device_used = result[device_id]["fb_memory_usage"]["used"]
+
+            if cur_device_used > 1024.0:
+                import socket
+
+                raise RuntimeError(
+                    f"The `{device_id}` device of node `{socket.gethostname()}` is occupied with "
+                    f"`{cur_device_used}` Mib before running.",
+                )
+
+
+assert_current_device_empty()
 
 from pickle import FALSE
 import socket
@@ -214,6 +237,8 @@ def main(args):
     # initialize the batch skipper
     batch_skipper = BatchSkipper(skip_batches)
 
+    # torch.cuda.set_per_process_memory_fraction(fraction=0.945)
+
     trainer.train()
 
     # transfer the train data loader into train data iterator
@@ -249,6 +274,8 @@ def main(args):
 
             # do forward and backward
             timer("fwd-bwd").start()
+
+            optimizer.grad_buffer()
 
             moe_loss = None
             if hasattr(gpc.config.model, "num_experts"):

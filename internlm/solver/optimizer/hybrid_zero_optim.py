@@ -296,6 +296,23 @@ class HybridZeroOptimizer(BaseOptimizer):
     def _is_gate_group(self, param_group):
         return "gate" in param_group.keys() and param_group["gate"]
 
+    def grad_buffer(self):
+        for group_id in range(len(self.param_groups)):
+            for rank in range(self._zero_world_size[group_id]):
+                if rank not in self.param_group_no_params_ranks[group_id]:
+                    tensor_list = self._param_store.get_fp16_params_by_rank_group(rank, group_id)
+                    with torch.no_grad():
+                        size = sum([tensor.numel() for tensor in tensor_list])
+                        flat_tensor = torch.zeros(size, dtype=torch.bfloat16, device=get_current_device())
+                        grad_list = [
+                            torch.zeros_like(tensor, dtype=torch.bfloat16, device=get_current_device())
+                            for tensor in tensor_list
+                        ]
+                        sync_param(flat_tensor=flat_tensor, tensor_list=grad_list)
+
+                        for idx, tensor in enumerate(tensor_list):
+                            tensor.grad = grad_list[idx]
+
     # TODO check expert dp is correct when enable moe and overlap both
     def _attach_reduction_hook(self):
         # we iterate over the fp16 params
