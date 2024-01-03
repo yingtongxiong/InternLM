@@ -262,6 +262,12 @@ class BaseFeedForward(nn.Module):
         )
 
     def forward(self, x):
+        # w1_o: torch.Size([8192, 13824]), w2_o:torch.Size([8192, 13824]), w3_in: torch.Size([8192, 13824])
+        from internlm.utils.common import get_current_device
+
+        a = torch.ones(size=[x.shape[0] * self.hidden_features * 3], dtype=torch.bfloat16, device=get_current_device())
+        del a
+
         w1_o = self.w1(x)
         w2_o = self.w2(x)
         out = self.w3(Silu(w1_o, w2_o))

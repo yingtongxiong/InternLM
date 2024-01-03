@@ -183,22 +183,29 @@ class RotaryEmbedding(torch.nn.Module):
             # Don't do einsum, it converts fp32 to fp16
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             freqs = torch.outer(t, self.inv_freq.to(device=t.device))
-            # global cache_sin_cos
-            # if cache_sin_cos is None:
-            #     with torch.no_grad():
-            #         cache_sin_cos = [
-            #             torch.zeros_like(torch.cos(freqs).to(x.dtype), dtype=x.dtype)
-            #             for _ in range(gpc.config.NUM_LAYER * 2)
-            #         ]
-            #         flat_buffer = _flatten_dense_tensors(cache_sin_cos)
-            #         _sync_param(flat_buffer, cache_sin_cos)
-            # self._cos_cached = cache_sin_cos[self.block_idx * 2]
-            # self._sin_cached = cache_sin_cos[self.block_idx * 2 + 1]
+
+            # open sin cos cache
+            global cache_sin_cos
+            if cache_sin_cos is None:
+                with torch.no_grad():
+                    cache_sin_cos = [
+                        torch.zeros_like(torch.cos(freqs).to(x.dtype), dtype=x.dtype)
+                        for _ in range(gpc.config.NUM_LAYER * 2)
+                    ]
+                    flat_buffer = _flatten_dense_tensors(cache_sin_cos)
+                    _sync_param(flat_buffer, cache_sin_cos)
+            self._cos_cached = cache_sin_cos[self.block_idx * 2]
+            self._sin_cached = cache_sin_cos[self.block_idx * 2 + 1]
+
             if self.scale is None:
-                # self._sin_cached.copy_(torch.sin(freqs).to(x.dtype))
-                # self._cos_cached.copy_(torch.cos(freqs).to(x.dtype))
-                self._cos_cached = torch.cos(freqs).to(x.dtype)
-                self._sin_cached = torch.sin(freqs).to(x.dtype)
+
+                # open sin cos cache
+                self._sin_cached.copy_(torch.sin(freqs).to(x.dtype))
+                self._cos_cached.copy_(torch.cos(freqs).to(x.dtype))
+
+                # not open
+                # self._cos_cached = torch.cos(freqs).to(x.dtype)
+                # self._sin_cached = torch.sin(freqs).to(x.dtype)
             else:
                 power = (
                     torch.arange(seqlen, dtype=self.scale.dtype, device=self.scale.device) - seqlen // 2

@@ -494,6 +494,7 @@ tgs_list = []
 tflops_list = []
 tflops_list_2 = []
 loss_list = []
+max_memalloc_list = []
 
 
 @llm_timeout(func_name="record_current_batch_training_metrics")
@@ -693,28 +694,32 @@ def record_current_batch_training_metrics(
             tgs_list.append(tgs_origin)
             tflops_list.append(tflops)
             tflops_list_2.append(tflops_2)
+            max_memalloc_list.append(torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024)
         if batch_count == gpc.config.data.total_steps - 1:
             print(tgs_list, flush=True)
             if len(tgs_list) <= 0:
                 return
-            avg_tgs = sum(tgs_list) / len(tgs_list)
-            for tgs in tgs_list.copy():
-                if abs(tgs - avg_tgs) > 400:
-                    tgs_list.remove(tgs)
+            # avg_tgs = sum(tgs_list) / len(tgs_list)
+            # for tgs in tgs_list.copy():
+            #     if abs(tgs - avg_tgs) > 400:
+            #         tgs_list.remove(tgs)
             print(f"avg_tgs: {sum(tgs_list)/len(tgs_list)}", flush=True)
 
             print(tflops_list, flush=True)
-            avg_tflops = sum(tflops_list) / len(tflops_list)
-            for tf in tflops_list.copy():
-                if abs(tf - avg_tflops) > 10:
-                    tflops_list.remove(tf)
+            # avg_tflops = sum(tflops_list) / len(tflops_list)
+            # for tf in tflops_list.copy():
+            #     if abs(tf - avg_tflops) > 10:
+            #         tflops_list.remove(tf)
             print(f"avg_tflops: {sum(tflops_list)/len(tflops_list)}", flush=True)
 
             print(tflops_list_2, flush=True)
-            avg_tflops_2 = sum(tflops_list_2) / len(tflops_list_2)
-            for tf in tflops_list_2.copy():
-                if abs(tf - avg_tflops_2) > 10:
-                    tflops_list_2.remove(tf)
+            # avg_tflops_2 = sum(tflops_list_2) / len(tflops_list_2)
+            # for tf in tflops_list_2.copy():
+            #     if abs(tf - avg_tflops_2) > 10:
+            #         tflops_list_2.remove(tf)
             print(f"avg_tflops_2: {sum(tflops_list_2)/len(tflops_list_2)}", flush=True)
+
+            print(max_memalloc_list, flush=True)
+            print(f"avg_max_mem_alloc: {sum(max_memalloc_list)/len(max_memalloc_list)} GB", flush=True)
 
             print("loss: ", loss_list, flush=True)

@@ -1,7 +1,7 @@
 JOB_NAME = "7b_train"
 DO_ALERT = False
 
-SEQ_LEN = 2048
+SEQ_LEN = 8 * 1024
 HIDDEN_SIZE = 4096
 NUM_ATTENTION_HEAD = 32
 MLP_RATIO = 8 / 3
@@ -49,9 +49,9 @@ VALID_FOLDER = "/path/to/dataset"
 data = dict(
     seq_len=SEQ_LEN,
     # micro_num means the number of micro_batch contained in one gradient update
-    micro_num=4,
+    micro_num=8,
     # packed_length = micro_bsz * SEQ_LEN
-    micro_bsz=2,
+    micro_bsz=8,
     # defaults to the value of micro_num
     valid_micro_num=4,
     # defaults to 0, means disable evaluate
@@ -167,10 +167,10 @@ weight parallel (dict):
     3. memory_pool: bool, enable/disable memory pool, defaults to False.
 """
 parallel = dict(
-    zero1=dict(size=2, fsdp=False),
-    tensor=dict(size=4, mode="mtp"),
-    pipeline=dict(size=2, interleaved_overlap=True),
-    weight=dict(size=1, overlap=True, memory_pool=True),
+    zero1=dict(size=1, fsdp=False),
+    tensor=dict(size=8, mode="isp"),
+    pipeline=dict(size=1, interleaved_overlap=True),
+    weight=dict(size=8, overlap=True, memory_pool=True),
 )
 
 cudnn_deterministic = False
