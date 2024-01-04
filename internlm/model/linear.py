@@ -232,6 +232,7 @@ class BaseFeedForward(nn.Module):
     ):
         super().__init__()
         hidden_features = multiple_of * ((hidden_features + multiple_of - 1) // multiple_of)
+        self.hidden_features = hidden_features
 
         self.w1 = colum_cls(
             in_features,
