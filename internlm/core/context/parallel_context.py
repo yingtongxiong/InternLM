@@ -420,7 +420,6 @@ class ParallelContext(metaclass=SingletonMeta):
         #     f"({pps}) * tensor parallel size ({tps})"
         # )
         assert self.zero1_parallel_size > 0
-        assert self.data_parallel_size % self.zero1_parallel_size == 0
 
         # check for fsdp:
         # if zo_size < dp_size, ckpts saving will introduce redundent storage for model weights
@@ -470,10 +469,16 @@ class ParallelContext(metaclass=SingletonMeta):
             assert (
                 self.zero1_parallel_size <= self.data_parallel_size
             ), f"zero1_size:{self.zero1_parallel_size} should be less than dp_size:{self.data_parallel_size}"
+            assert (
+                self.data_parallel_size % self.zero1_parallel_size == 0
+            ), f"data_parallel_size:{self.data_parallel_size} % zero1_parallel_size: {self.zero1_parallel_size} != 0"
         else:
             assert (
                 self.zero1_parallel_size <= self.weight_data_parallel_size
             ), f"zero1_size:{self.zero1_parallel_size} should be less than wdp_size:{self.weight_data_parallel_size}"
+            assert (
+                self.weight_data_parallel_size % self.zero1_parallel_size == 0
+            ), f"weight_data_parallel_size:{self.weight_data_parallel_size} % zero1_parallel_size: {self.zero1_parallel_size} != 0"
 
         # the recommended nettest_parallel_size is 32 GPUs
         self.nettest_parallel_size = 32
