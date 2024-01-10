@@ -139,8 +139,10 @@ def split_params_into_different_groups_for_optimizer_with_new_partition_strategy
         pgroup["optimizer_mode"] = ParallelMode.ZERO1
 
     # param groups may contain empty groups, such as embed_head
-    # if len(new_groups["embed_head"]["params"]) > 0:
-    param_groups.extend(new_groups.values())
+    if gpc.config.parallel.tensor.mode == "isp":
+        param_groups.extend(new_groups.values())
+    else:
+        assert len(new_groups["embed_head"]["params"]) <= 0
 
     # print(f"ht debug params_groups after split default len:{len(param_groups[0]['params'])}", flush=True)
     # print(f"ht debug params_groups after split embed_head len:{len(param_groups[1]['params'])}", flush=True)
