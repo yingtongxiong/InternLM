@@ -45,6 +45,7 @@ from internlm.model.metrics import AccPerplex, SchedulerMetricHook
 from internlm.model.overlap_handler import FSTPOverlapSchedulerHook
 from internlm.monitor import initialize_monitor_manager, send_alert_message
 from internlm.monitor.monitor import monitor_manager as mm
+from internlm.model.embedding import clear_sin_cos_cache
 from internlm.train import (
     get_train_data_loader,
     get_validation_data_loader,
@@ -294,8 +295,10 @@ def main(args):
                 )
             timer("fwd-bwd").stop()
 
+            # clear memory pool
             if gpc.fstp_handler is not None and gpc.fstp_handler.enable_memory_pool:
                 gpc.fstp_handler.clear_memory_pool()
+            clear_sin_cos_cache()
 
             # update parameters, and returns (success_update, grad_norm)
             trainer_result = trainer.step()

@@ -121,6 +121,11 @@ legacy_apply_rotary_embed = LegacyApplyRotaryEmb.apply
 cache_sin_cos = None
 
 
+def clear_sin_cos_cache():
+    global cache_sin_cos
+    cache_sin_cos = None
+
+
 class RotaryEmbedding(torch.nn.Module):
     """
     The rotary position embeddings from RoFormer_ (Su et. al).
@@ -198,7 +203,6 @@ class RotaryEmbedding(torch.nn.Module):
             self._sin_cached = cache_sin_cos[self.block_idx * 2 + 1]
 
             if self.scale is None:
-
                 # open sin cos cache
                 self._sin_cached.copy_(torch.sin(freqs).to(x.dtype))
                 self._cos_cached.copy_(torch.cos(freqs).to(x.dtype))
